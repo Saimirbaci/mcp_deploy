@@ -130,3 +130,27 @@ pub fn list_db_tables(target: &str, config: &Config) -> Result<String> {
 
     run_ssh_command(target, &psql_cmd, config)
 }
+pub fn update_remote_env_file(target: &str, remote_path: &str, key: &str, value: &str, config: &Config) -> Result<()> {
+    let content = read_remote_file(target, remote_path, config)?;
+    let mut lines: Vec<String> = content.lines().map(|l| l.to_string()).collect();
+    let mut found = false;
+    let new_line = format!("{}={}", key, value);
+
+    for line in &mut lines {
+        if line.trim().starts_with(key) && line.contains('=') {
+            let parts: Vec<&str> = line.splitn(2, '=').collect();
+            if parts[0].trim() == key {
+                *line = new_line.clone();
+                found = true;
+                break;
+            }
+        }
+    }
+
+    if !found {
+        lines.push(new_line);
+    }
+
+    let new_content = lines.join("\n");
+    write_remote_file(target, remote_path, &new_content, config)
+}

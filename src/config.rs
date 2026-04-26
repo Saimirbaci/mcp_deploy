@@ -18,11 +18,37 @@ pub struct ServerInfo {
     pub user: String,
     pub key_path: String,
     pub db_config: Option<DbConfig>,
+    pub default_env_path: Option<String>,
+    pub secrets_path: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Config {
     pub servers: HashMap<String, ServerInfo>,
+}
+
+pub struct Secrets {
+    pub data: HashMap<String, String>,
+}
+
+impl Secrets {
+    pub fn load<P: AsRef<Path>>(path: P) -> Result<Self> {
+        if !path.as_ref().exists() {
+            return Ok(Secrets { data: HashMap::new() });
+        }
+        let content = fs::read_to_string(path)?;
+        let data: HashMap<String, String> = serde_json::from_str(&content)
+            .context("Failed to parse secrets JSON")?;
+        Ok(Secrets { data })
+    }
+
+    pub fn list_names(&self) -> Vec<String> {
+        self.data.keys().cloned().collect()
+    }
+
+    pub fn get(&self, name: &str) -> Option<String> {
+        self.data.get(name).cloned()
+    }
 }
 
 impl Config {

@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::io::{self, BufRead, Write};
-use crate::config::Config;
+use crate::config::{Config, Secrets};
 use crate::ssh;
 use anyhow::Result;
 use tracing::error;
@@ -31,6 +31,7 @@ use std::path::PathBuf;
 
 pub fn run_server(initial_config: Config, config_path: String) -> Result<()> {
     let config = Arc::new(RwLock::new(initial_config));
+    
     let config_for_watcher = Arc::clone(&config);
     let path_for_watcher = PathBuf::from(&config_path);
 
@@ -218,6 +219,46 @@ fn handle_request(req: JsonRpcRequest, config: &Config) -> JsonRpcResponse {
                             },
                             "required": ["target"]
                         }
+                    },
+                    {
+                        "name": "list_local_secret_names",
+                        "description": "Lists the names of secrets available in the local vault associated with a specific server. Claude only sees the names, not the values.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "target": {
+                                    "type": "string",
+                                    "description": "The IP address or Alias of the server to check secrets for."
+                                }
+                            },
+                            "required": ["target"]
+                        }
+                    },
+                    {
+                        "name": "deploy_secret_to_server",
+                        "description": "Takes a secret from your local vault and injects it into a remote .env file. The secret value never leaves the MCP server's process except to travel over the secure SSH tunnel.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "target": {
+                                    "type": "string",
+                                    "description": "The IP address or Alias of the server."
+                                },
+                                "remote_env_path": {
+                                    "type": "string",
+                                    "description": "Optional: The absolute path to the .env file. If omitted, the server's default_env_path will be used."
+                                },
+                                "env_key": {
+                                    "type": "string",
+                                    "description": "The key name to set in the remote .env file (e.g. STRIPE_API_KEY)."
+                                },
+                                "local_secret_name": {
+                                    "type": "string",
+                                    "description": "The name of the secret in your local mcp_secrets.json vault."
+                                }
+                            },
+                            "required": ["target", "env_key", "local_secret_name"]
+                        }
                     }
                 ]
             })),
@@ -277,30 +318,45 @@ fn handle_request(req: JsonRpcRequest, config: &Config) -> JsonRpcResponse {
                     let target = arguments["target"].as_str().unwrap_or("");
                     let path = arguments["path"].as_str().unwrap_or("");
                     
-                    match ssh::read_remote_file(target, path, config) {
-                        Ok(content) => (
-                            Some(json!({
-                                "content": [
-                                    {
-                                        "type": "text",
-                                        "text": content
-                                    }
-                                ]
-                            })),
-                            None
-                        ),
-                        Err(e) => (
+                    if path.contains(".env") {
+                        (
                             Some(json!({
                                 "isError": true,
                                 "content": [
                                     {
                                         "type": "text",
-                                        "text": format!("Error reading file: {}", e)
+                                        "text": "Security Error: Reading .env files is prohibited for safety reasons. Use the deploy_secret tools instead."
                                     }
                                 ]
                             })),
                             None
-                        ),
+                        )
+                    } else {
+                        match ssh::read_remote_file(target, path, config) {
+                            Ok(content) => (
+                                Some(json!({
+                                    "content": [
+                                        {
+                                            "type": "text",
+                                            "text": content
+                                        }
+                                    ]
+                                })),
+                                None
+                            ),
+                            Err(e) => (
+                                Some(json!({
+                                    "isError": true,
+                                    "content": [
+                                        {
+                                            "type": "text",
+                                            "text": format!("Error reading file: {}", e)
+                                        }
+                                    ]
+                                })),
+                                None
+                            ),
+                        }
                     }
                 }
                 "write_remote_file" => {
@@ -386,6 +442,156 @@ fn handle_request(req: JsonRpcRequest, config: &Config) -> JsonRpcResponse {
                                     {
                                         "type": "text",
                                         "text": format!("Database error: {}", e)
+                                    }
+                                ]
+                            })),
+                            None
+                        ),
+                    }
+                }
+                "list_local_secret_names" => {
+                    let target = arguments["target"].as_str().unwrap_or("");
+                    match config.get_server_by_target(target) {
+                        Some((_ip, info)) => {
+                            let home = std::env::var("HOME").unwrap_or_default();
+                            let secrets_path = info.secrets_path.clone().unwrap_or_else(|| format!("{}/.remote_connections/mcp_secrets.json", home));
+                            
+                            match Secrets::load(&secrets_path) {
+                                Ok(s) => {
+                                    let names = s.list_names();
+                                    (
+                                        Some(json!({
+                                            "content": [
+                                                {
+                                                    "type": "text",
+                                                    "text": format!("Available Secrets for {}: {:?}", target, names)
+                                                }
+                                            ]
+                                        })),
+                                        None
+                                    )
+                                }
+                                Err(e) => (
+                                    Some(json!({
+                                        "isError": true,
+                                        "content": [
+                                            {
+                                                "type": "text",
+                                                "text": format!("Failed to load secrets from {}: {}", secrets_path, e)
+                                            }
+                                        ]
+                                    })),
+                                    None
+                                )
+                            }
+                        }
+                        None => (
+                            Some(json!({
+                                "isError": true,
+                                "content": [
+                                    {
+                                        "type": "text",
+                                        "text": format!("Target {} not found", target)
+                                    }
+                                ]
+                            })),
+                            None
+                        ),
+                    }
+                }
+                "deploy_secret_to_server" => {
+                    let target = arguments["target"].as_str().unwrap_or("");
+                    let remote_env_path = arguments["remote_env_path"].as_str().unwrap_or("");
+                    let env_key = arguments["env_key"].as_str().unwrap_or("");
+                    let local_secret_name = arguments["local_secret_name"].as_str().unwrap_or("");
+                    
+                    match config.get_server_by_target(target) {
+                        Some((_ip, info)) => {
+                            let path_opt = if remote_env_path.is_empty() {
+                                info.default_env_path.clone()
+                            } else {
+                                Some(remote_env_path.to_string())
+                            };
+
+                            match path_opt {
+                                Some(path_to_use) => {
+                                    let home = std::env::var("HOME").unwrap_or_default();
+                                    let secrets_path = info.secrets_path.clone().unwrap_or_else(|| format!("{}/.remote_connections/mcp_secrets.json", home));
+                                    
+                                    match Secrets::load(&secrets_path) {
+                                        Ok(s) => {
+                                            match s.get(local_secret_name) {
+                                                Some(secret_value) => {
+                                                    match ssh::update_remote_env_file(target, &path_to_use, env_key, &secret_value, config) {
+                                                        Ok(_) => (
+                                                            Some(json!({
+                                                                "content": [
+                                                                    {
+                                                                        "type": "text",
+                                                                        "text": format!("Successfully deployed secret '{}' to {} on {}", local_secret_name, env_key, target)
+                                                                    }
+                                                                ]
+                                                            })),
+                                                            None
+                                                        ),
+                                                        Err(e) => (
+                                                            Some(json!({
+                                                                "isError": true,
+                                                                "content": [
+                                                                    {
+                                                                        "type": "text",
+                                                                        "text": format!("Failed to deploy secret: {}", e)
+                                                                    }
+                                                                ]
+                                                            })),
+                                                            None
+                                                        ),
+                                                    }
+                                                }
+                                                None => (
+                                                    Some(json!({
+                                                        "isError": true,
+                                                        "content": [
+                                                            {
+                                                                "type": "text",
+                                                                "text": format!("Secret '{}' not found in {}", local_secret_name, secrets_path)
+                                                            }
+                                                        ]
+                                                    })),
+                                                    None
+                                                )
+                                            }
+                                        }
+                                        Err(e) => (
+                                            Some(json!({
+                                                "isError": true,
+                                                "content": [
+                                                    {
+                                                        "type": "text",
+                                                        "text": format!("Failed to load secrets: {}", e)
+                                                    }
+                                                ]
+                                            })),
+                                            None
+                                        )
+                                    }
+                                }
+                                None => (
+                                    None,
+                                    Some(json!({
+                                        "code": -32602,
+                                        "message": "No remote_env_path provided and no default_env_path configured for this server."
+                                    }))
+                                )
+                            }
+                        }
+                        None => (
+                            Some(json!({
+                                "isError": true,
+                                "content": [
+                                    {
+                                        "type": "text",
+                                        "text": format!("Target {} not found", target)
                                     }
                                 ]
                             })),

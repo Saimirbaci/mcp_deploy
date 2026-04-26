@@ -92,13 +92,18 @@ Or specify a custom config path:
    - **Arguments**: `target` (string), `path` (string)
 4. **`write_remote_file`**: Writes/Overwrites a file on the remote server using SFTP.
    - **Arguments**: `target` (string), `path` (string), `content` (string)
+5. **`list_local_secret_names`**: Lists the names (labels) of secrets stored in your local Mac vault.
+   - **Note**: Claude never sees the values, only the labels.
+6. **`deploy_secret_to_server`**: Injects a secret from your local vault into a remote `.env` file.
+   - **Arguments**: `target`, `remote_env_path`, `env_key`, `local_secret_name`
 
-### Advanced Workflow: Editing Configs
-These SFTP tools allow the Agent to safely edit remote configuration files:
-1. Agent uses `read_remote_file` to get the current content.
-2. Agent modifies the content locally.
-3. Agent uses `write_remote_file` to save the new version.
-This is significantly more robust than using `sed` or `echo` via shell commands.
+### Blind Secret Injection (Ultra-Secure)
+This tool allows you to manage production secrets without Claude ever seeing them:
+1. Create a file at `~/.remote_connections/mcp_secrets.json` on your Mac.
+2. Store your secrets there: `{"StripeProdKey": "sk_live_..."}`.
+3. Tell Claude: *"Deploy the 'StripeProdKey' to the beta server as 'STRIPE_SECRET'."*
+4. The MCP server fetches the value locally and pushes it to the server over SSH.
+5. **The secret never appears in the Claude chat history or logs.**
 
 - **Agent Isolation**: Agents only provide the IP and the command. They never see the SSH keys or the usernames.
 - **Boundary Control**: If an IP is not in the configuration file, the tool will refuse to connect, preventing unauthorized lateral movement.
