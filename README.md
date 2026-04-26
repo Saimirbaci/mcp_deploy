@@ -85,11 +85,20 @@ Or specify a custom config path:
 
 ## Available Tools (MCP)
 
-1. **`list_allowed_servers`**: Returns the list of IP addresses the agent is allowed to connect to.
+1. **`list_allowed_servers`**: Returns the list of IP addresses and Aliases the agent is allowed to connect to.
 2. **`run_command`**: Executes a command on a remote server.
-   - **Arguments**: `ip` (string), `command` (string)
+   - **Arguments**: `target` (string), `command` (string)
+3. **`read_remote_file`**: Reads a file from the remote server using SFTP.
+   - **Arguments**: `target` (string), `path` (string)
+4. **`write_remote_file`**: Writes/Overwrites a file on the remote server using SFTP.
+   - **Arguments**: `target` (string), `path` (string), `content` (string)
 
-## Security
+### Advanced Workflow: Editing Configs
+These SFTP tools allow the Agent to safely edit remote configuration files:
+1. Agent uses `read_remote_file` to get the current content.
+2. Agent modifies the content locally.
+3. Agent uses `write_remote_file` to save the new version.
+This is significantly more robust than using `sed` or `echo` via shell commands.
 
 - **Agent Isolation**: Agents only provide the IP and the command. They never see the SSH keys or the usernames.
 - **Boundary Control**: If an IP is not in the configuration file, the tool will refuse to connect, preventing unauthorized lateral movement.

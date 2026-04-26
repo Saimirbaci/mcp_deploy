@@ -36,3 +36,41 @@ pub fn run_ssh_command(target: &str, command: &str, config: &Config) -> Result<S
     
     Ok(output)
 }
+pub fn read_remote_file(target: &str, remote_path: &str, config: &Config) -> Result<String> {
+    let (ip, server_info) = config.get_server_by_target(target)
+        .ok_or_else(|| anyhow!("Target {} not found", target))?;
+
+    let tcp = TcpStream::connect(format!("{}:22", ip))?;
+    let mut sess = Session::new()?;
+    sess.set_tcp_stream(tcp);
+    sess.handshake()?;
+    sess.userauth_pubkey_file(&server_info.user, None, Path::new(&server_info.key_path), None)?;
+
+    let sftp = sess.sftp().context("Failed to start SFTP session")?;
+    let mut file = sftp.open(Path::new(remote_path)).context("Failed to open remote file")?;
+    
+    let mut content = String::new();
+    file.read_to_string(&mut content).context("Failed to read remote file content")?;
+    
+    Ok(content)
+}
+
+pub fn write_remote_file(target: &str, remote_path: &str, content: &str, config: &Config) -> Result<()> {
+    let (ip, server_info) = config.get_server_by_target(target)
+        .ok_or_else(|| anyhow!("Target {} not found", target))?;
+
+    let tcp = TcpStream::connect(format!("{}:22", ip))?;
+    let mut sess = Session::new()?;
+    sess.set_tcp_stream(tcp);
+    sess.handshake()?;
+    sess.userauth_pubkey_file(&server_info.user, None, Path::new(&server_info.key_path), None)?;
+
+    let sftp = sess.sftp().context("Failed to start SFTP session")?;
+    let mut file = sftp.create(Path::new(remote_path)).context("Failed to create remote file")?;
+    
+    use std::io::Write;
+    file.write_all(content.as_bytes()).context("Failed to write to remote file")?;
+    file.flush()?;
+    
+    Ok(())
+}

@@ -146,6 +146,46 @@ fn handle_request(req: JsonRpcRequest, config: &Config) -> JsonRpcResponse {
                             },
                             "required": ["target", "command"]
                         }
+                    },
+                    {
+                        "name": "read_remote_file",
+                        "description": "Reads the content of a file from a remote server using SFTP.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "target": {
+                                    "type": "string",
+                                    "description": "The IP address or Alias of the server."
+                                },
+                                "path": {
+                                    "type": "string",
+                                    "description": "The absolute path to the file on the remote server."
+                                }
+                            },
+                            "required": ["target", "path"]
+                        }
+                    },
+                    {
+                        "name": "write_remote_file",
+                        "description": "Writes content to a file on a remote server using SFTP. If the file exists, it will be overwritten.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "target": {
+                                    "type": "string",
+                                    "description": "The IP address or Alias of the server."
+                                },
+                                "path": {
+                                    "type": "string",
+                                    "description": "The absolute path where the file should be written on the remote server."
+                                },
+                                "content": {
+                                    "type": "string",
+                                    "description": "The text content to write to the file."
+                                }
+                            },
+                            "required": ["target", "path", "content"]
+                        }
                     }
                 ]
             })),
@@ -194,6 +234,67 @@ fn handle_request(req: JsonRpcRequest, config: &Config) -> JsonRpcResponse {
                                     {
                                         "type": "text",
                                         "text": format!("Error: {}", e)
+                                    }
+                                ]
+                            })),
+                            None
+                        ),
+                    }
+                }
+                "read_remote_file" => {
+                    let target = arguments["target"].as_str().unwrap_or("");
+                    let path = arguments["path"].as_str().unwrap_or("");
+                    
+                    match ssh::read_remote_file(target, path, config) {
+                        Ok(content) => (
+                            Some(json!({
+                                "content": [
+                                    {
+                                        "type": "text",
+                                        "text": content
+                                    }
+                                ]
+                            })),
+                            None
+                        ),
+                        Err(e) => (
+                            Some(json!({
+                                "isError": true,
+                                "content": [
+                                    {
+                                        "type": "text",
+                                        "text": format!("Error reading file: {}", e)
+                                    }
+                                ]
+                            })),
+                            None
+                        ),
+                    }
+                }
+                "write_remote_file" => {
+                    let target = arguments["target"].as_str().unwrap_or("");
+                    let path = arguments["path"].as_str().unwrap_or("");
+                    let content = arguments["content"].as_str().unwrap_or("");
+                    
+                    match ssh::write_remote_file(target, path, content, config) {
+                        Ok(_) => (
+                            Some(json!({
+                                "content": [
+                                    {
+                                        "type": "text",
+                                        "text": format!("Successfully wrote to {}", path)
+                                    }
+                                ]
+                            })),
+                            None
+                        ),
+                        Err(e) => (
+                            Some(json!({
+                                "isError": true,
+                                "content": [
+                                    {
+                                        "type": "text",
+                                        "text": format!("Error writing file: {}", e)
                                     }
                                 ]
                             })),
