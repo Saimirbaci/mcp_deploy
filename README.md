@@ -8,7 +8,7 @@ A secure Model Context Protocol (MCP) server and CLI tool written in Rust for ex
 - **IP Whitelisting**: Strictly enforces execution only on allowed IP addresses.
 - **Dual Mode**: Works as both a standard CLI tool and an MCP server for AI integration.
 - **Discovery**: Exposes a tool for agents to list available servers.
-- **Automatic Configuration**: Defaults to using a configuration file in your home directory.
+- **Hot-Reloading**: Automatically detects and applies changes to the configuration file without restarting the server.
 
 ## Prerequisites
 
