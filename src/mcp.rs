@@ -131,7 +131,7 @@ fn handle_request(req: JsonRpcRequest, config: &Config) -> JsonRpcResponse {
                     },
                     {
                         "name": "run_command",
-                        "description": "Executes a command on a remote server via SSH. The target can be an IP address or an Alias defined in the config.",
+                        "description": "Executes a command on a remote server via SSH. IMPORTANT: This tool is NON-INTERACTIVE and NON-STREAMING. Do not use commands that require user input (e.g. sudo without -n) or commands that run indefinitely (e.g. tail -f). Use bounded commands like 'tail -n 100' instead.",
                         "inputSchema": {
                             "type": "object",
                             "properties": {
@@ -141,7 +141,7 @@ fn handle_request(req: JsonRpcRequest, config: &Config) -> JsonRpcResponse {
                                 },
                                 "command": {
                                     "type": "string",
-                                    "description": "The command to execute."
+                                    "description": "The command to execute (e.g. 'ls -la', 'uptime', 'tail -n 50 /var/log/syslog')."
                                 }
                             },
                             "required": ["target", "command"]
