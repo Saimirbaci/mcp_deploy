@@ -74,3 +74,59 @@ pub fn write_remote_file(target: &str, remote_path: &str, content: &str, config:
     
     Ok(())
 }
+pub fn query_database(target: &str, query: &str, config: &Config) -> Result<String> {
+    let (_ip, server_info) = config.get_server_by_target(target)
+        .ok_or_else(|| anyhow!("Target {} not found", target))?;
+
+    let db_config = server_info.db_config.as_ref()
+        .ok_or_else(|| anyhow!("Database is not configured for target {}", target))?;
+
+    // Basic security check for readonly servers
+    if db_config.readonly {
+        let q = query.trim().to_lowercase();
+        if !q.starts_with("select") {
+            return Err(anyhow!("Permission denied: Only SELECT queries are allowed on this server ({})", target));
+        }
+        let destructive = ["drop", "delete", "truncate", "update", "insert", "alter", "create", "grant"];
+        for keyword in destructive {
+            if q.contains(keyword) {
+                // Check if the keyword is not just part of a column name (simple check)
+                if q.contains(&format!(" {} ", keyword)) || q.contains(&format!("{};", keyword)) {
+                    return Err(anyhow!("Permission denied: destructive keyword '{}' detected in readonly mode", keyword));
+                }
+            }
+        }
+    }
+
+    let password_env = if let Some(pw) = &db_config.password {
+        format!("PGPASSWORD='{}' ", pw)
+    } else {
+        String::new()
+    };
+
+    // psql -h localhost -U user -d db -c "query"
+    // Use --csv for clean parsing or -P pager=off for raw table
+    let psql_cmd = format!("{}psql -h localhost -U {} -d {} -c \"{}\"", 
+        password_env, db_config.user, db_config.name, query.replace("\"", "\\\""));
+
+    run_ssh_command(target, &psql_cmd, config)
+}
+
+pub fn list_db_tables(target: &str, config: &Config) -> Result<String> {
+    let (_ip, server_info) = config.get_server_by_target(target)
+        .ok_or_else(|| anyhow!("Target {} not found", target))?;
+
+    let db_config = server_info.db_config.as_ref()
+        .ok_or_else(|| anyhow!("Database is not configured for target {}", target))?;
+
+    let password_env = if let Some(pw) = &db_config.password {
+        format!("PGPASSWORD='{}' ", pw)
+    } else {
+        String::new()
+    };
+
+    let psql_cmd = format!("{}psql -h localhost -U {} -d {} -c \"\\dt\"", 
+        password_env, db_config.user, db_config.name);
+
+    run_ssh_command(target, &psql_cmd, config)
+}

@@ -5,10 +5,19 @@ use std::path::Path;
 use anyhow::{Context, Result};
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct DbConfig {
+    pub user: String,
+    pub name: String,
+    pub password: Option<String>,
+    pub readonly: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ServerInfo {
     pub alias: String,
     pub user: String,
     pub key_path: String,
+    pub db_config: Option<DbConfig>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]

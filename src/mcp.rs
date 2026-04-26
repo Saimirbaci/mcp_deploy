@@ -186,6 +186,38 @@ fn handle_request(req: JsonRpcRequest, config: &Config) -> JsonRpcResponse {
                             },
                             "required": ["target", "path", "content"]
                         }
+                    },
+                    {
+                        "name": "query_database",
+                        "description": "Executes a SQL query on the server's Postgres database via psql. Safety: Production servers are strictly read-only (SELECT only). Beta servers may allow data modification.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "target": {
+                                    "type": "string",
+                                    "description": "The IP address or Alias of the server."
+                                },
+                                "query": {
+                                    "type": "string",
+                                    "description": "The SQL query to execute."
+                                }
+                            },
+                            "required": ["target", "query"]
+                        }
+                    },
+                    {
+                        "name": "list_db_tables",
+                        "description": "Lists all tables in the remote database to help explore the schema.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "target": {
+                                    "type": "string",
+                                    "description": "The IP address or Alias of the server."
+                                }
+                            },
+                            "required": ["target"]
+                        }
                     }
                 ]
             })),
@@ -295,6 +327,65 @@ fn handle_request(req: JsonRpcRequest, config: &Config) -> JsonRpcResponse {
                                     {
                                         "type": "text",
                                         "text": format!("Error writing file: {}", e)
+                                    }
+                                ]
+                            })),
+                            None
+                        ),
+                    }
+                }
+                "query_database" => {
+                    let target = arguments["target"].as_str().unwrap_or("");
+                    let query = arguments["query"].as_str().unwrap_or("");
+                    
+                    match ssh::query_database(target, query, config) {
+                        Ok(output) => (
+                            Some(json!({
+                                "content": [
+                                    {
+                                        "type": "text",
+                                        "text": output
+                                    }
+                                ]
+                            })),
+                            None
+                        ),
+                        Err(e) => (
+                            Some(json!({
+                                "isError": true,
+                                "content": [
+                                    {
+                                        "type": "text",
+                                        "text": format!("Database error: {}", e)
+                                    }
+                                ]
+                            })),
+                            None
+                        ),
+                    }
+                }
+                "list_db_tables" => {
+                    let target = arguments["target"].as_str().unwrap_or("");
+                    
+                    match ssh::list_db_tables(target, config) {
+                        Ok(output) => (
+                            Some(json!({
+                                "content": [
+                                    {
+                                        "type": "text",
+                                        "text": output
+                                    }
+                                ]
+                            })),
+                            None
+                        ),
+                        Err(e) => (
+                            Some(json!({
+                                "isError": true,
+                                "content": [
+                                    {
+                                        "type": "text",
+                                        "text": format!("Database error: {}", e)
                                     }
                                 ]
                             })),
