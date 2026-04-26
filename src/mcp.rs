@@ -4,10 +4,11 @@ use std::io::{self, BufRead, Write};
 use crate::config::Config;
 use crate::ssh;
 use anyhow::Result;
-use tracing::{info, error};
+use tracing::error;
 
 #[derive(Debug, Deserialize)]
 struct JsonRpcRequest {
+    #[allow(dead_code)]
     jsonrpc: String,
     method: String,
     params: Option<Value>,
