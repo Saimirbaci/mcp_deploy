@@ -56,7 +56,7 @@ fn main() -> Result<()> {
     match cli.command {
         Commands::Mcp {} => {
             let cfg = Config::load(&config_path).context(format!("Failed to load config from {}", config_path))?;
-            mcp::run_server(cfg)?;
+            mcp::run_server(cfg, config_path)?;
         }
         Commands::Cli { ip, command } => {
             let cfg = Config::load(&config_path).context(format!("Failed to load config from {}", config_path))?;

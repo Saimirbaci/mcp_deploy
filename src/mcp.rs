@@ -23,7 +23,37 @@ struct JsonRpcResponse {
     id: Value,
 }
 
-pub fn run_server(config: Config) -> Result<()> {
+use std::sync::{Arc, RwLock};
+use notify::{Watcher, RecursiveMode, EventKind};
+use std::path::PathBuf;
+
+pub fn run_server(initial_config: Config, config_path: String) -> Result<()> {
+    let config = Arc::new(RwLock::new(initial_config));
+    let config_for_watcher = Arc::clone(&config);
+    let path_for_watcher = PathBuf::from(&config_path);
+
+    // Setup file watcher
+    let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
+        match res {
+            Ok(event) => {
+                if let EventKind::Modify(_) = event.kind {
+                    match Config::load(&path_for_watcher) {
+                        Ok(new_config) => {
+                            if let Ok(mut w) = config_for_watcher.write() {
+                                *w = new_config;
+                                error!("Config reloaded successfully from {}", path_for_watcher.display());
+                            }
+                        }
+                        Err(e) => error!("Failed to reload config: {}", e),
+                    }
+                }
+            }
+            Err(e) => error!("Watch error: {:?}", e),
+        }
+    })?;
+
+    watcher.watch(PathBuf::from(&config_path).parent().unwrap_or(&PathBuf::from(".")), RecursiveMode::NonRecursive)?;
+
     let stdin = io::stdin();
     let mut stdout = io::stdout();
 
@@ -39,7 +69,8 @@ pub fn run_server(config: Config) -> Result<()> {
 
         match serde_json::from_str::<JsonRpcRequest>(&line) {
             Ok(req) => {
-                let response = handle_request(req, &config);
+                let current_config = config.read().map_err(|e| anyhow::anyhow!("Lock error: {}", e))?.clone();
+                let response = handle_request(req, &current_config);
                 let response_json = serde_json::to_string(&response)?;
                 writeln!(stdout, "{}", response_json)?;
                 stdout.flush()?;
