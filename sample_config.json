@@ -1,0 +1,9 @@
+{
+  "servers": {
+    "[IP_ADDRESS]": {
+      "alias": "local_vm",
+      "user": "user_name",
+      "key_path": "/Users/user_name/.ssh/id_rsa"
+    }
+  }
+}
