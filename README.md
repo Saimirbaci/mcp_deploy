@@ -38,10 +38,12 @@ By default, the tool looks for:
 {
   "servers": {
     "192.168.1.100": {
+      "alias": "prod-web-01",
       "user": "deploy",
       "key_path": "/Users/yourname/.ssh/id_rsa"
     },
-    "your-server-ip": {
+    "10.0.0.5": {
+      "alias": "staging-db",
       "user": "admin",
       "key_path": "/Users/yourname/.ssh/deploy_key"
     }
@@ -52,14 +54,14 @@ By default, the tool looks for:
 ## Usage
 
 ### CLI Mode
-Run commands directly from your terminal:
+Run commands using either the IP or the Alias:
 
 ```bash
-# Using default config
-./target/release/mcp_deploy cli --ip 192.168.1.100 -x "uptime"
+# Using Alias
+./target/release/mcp_deploy cli --ip prod-web-01 -x "uptime"
 
-# Using a custom config
-./target/release/mcp_deploy --config ./my_config.json cli --ip 192.168.1.100 -x "ls -la /var/www"
+# Using IP
+./target/release/mcp_deploy cli --ip 192.168.1.100 -x "ls -la"
 ```
 
 ### MCP Mode

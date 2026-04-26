@@ -5,12 +5,12 @@ use ssh2::Session;
 use anyhow::{anyhow, Result, Context};
 use crate::config::Config;
 
-pub fn run_ssh_command(ip: &str, command: &str, config: &Config) -> Result<String> {
-    let server_info = config.get_server(ip)
-        .ok_or_else(|| anyhow!("IP {} is not in the allowed servers list", ip))?;
+pub fn run_ssh_command(target: &str, command: &str, config: &Config) -> Result<String> {
+    let (ip, server_info) = config.get_server_by_target(target)
+        .ok_or_else(|| anyhow!("Target {} (IP or Alias) is not in the allowed servers list", target))?;
 
     let tcp = TcpStream::connect(format!("{}:22", ip))
-        .with_context(|| format!("Failed to connect to {}", ip))?;
+        .with_context(|| format!("Failed to connect to {} ({})", target, ip))?;
     
     let mut sess = Session::new()?;
     sess.set_tcp_stream(tcp);

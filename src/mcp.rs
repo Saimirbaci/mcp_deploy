@@ -100,7 +100,7 @@ fn handle_request(req: JsonRpcRequest, config: &Config) -> JsonRpcResponse {
             "tools": [
                 {
                     "name": "list_allowed_servers",
-                    "description": "Returns a list of IP addresses that this server is allowed to connect to.",
+                    "description": "Returns a list of servers (IP and Alias) that this server is allowed to connect to.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {}
@@ -108,20 +108,20 @@ fn handle_request(req: JsonRpcRequest, config: &Config) -> JsonRpcResponse {
                 },
                 {
                     "name": "run_command",
-                    "description": "Executes a command on a remote server via SSH. The IP must be in the allowed list.",
+                    "description": "Executes a command on a remote server via SSH. The target can be an IP address or an Alias defined in the config.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
-                            "ip": {
+                            "target": {
                                 "type": "string",
-                                "description": "The IP address of the server to connect to."
+                                "description": "The IP address or Alias of the server to connect to."
                             },
                             "command": {
                                 "type": "string",
                                 "description": "The command to execute."
                             }
                         },
-                        "required": ["ip", "command"]
+                        "required": ["target", "command"]
                     }
                 }
             ]
@@ -133,21 +133,21 @@ fn handle_request(req: JsonRpcRequest, config: &Config) -> JsonRpcResponse {
 
             match tool_name {
                 "list_allowed_servers" => {
-                    let ips = config.allowed_ips();
+                    let servers = config.allowed_servers();
                     Some(json!({
                         "content": [
                             {
                                 "type": "text",
-                                "text": format!("Allowed IPs: {:?}", ips)
+                                "text": format!("Allowed Servers: {:?}", servers)
                             }
                         ]
                     }))
                 }
                 "run_command" => {
-                    let ip = arguments["ip"].as_str().unwrap_or("");
+                    let target = arguments["target"].as_str().unwrap_or("");
                     let command = arguments["command"].as_str().unwrap_or("");
                     
-                    match ssh::run_ssh_command(ip, command, config) {
+                    match ssh::run_ssh_command(target, command, config) {
                         Ok(output) => Some(json!({
                             "content": [
                                 {

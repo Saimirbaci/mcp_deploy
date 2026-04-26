@@ -6,6 +6,7 @@ use anyhow::{Context, Result};
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ServerInfo {
+    pub alias: String,
     pub user: String,
     pub key_path: String,
 }
@@ -24,11 +25,25 @@ impl Config {
         Ok(config)
     }
 
-    pub fn get_server(&self, ip: &str) -> Option<&ServerInfo> {
-        self.servers.get(ip)
+    pub fn get_server_by_target(&self, target: &str) -> Option<(String, &ServerInfo)> {
+        // First try to find by IP (the map key)
+        if let Some(info) = self.servers.get(target) {
+            return Some((target.to_string(), info));
+        }
+        
+        // Then try to find by alias
+        for (ip, info) in &self.servers {
+            if info.alias == target {
+                return Some((ip.clone(), info));
+            }
+        }
+        
+        None
     }
 
-    pub fn allowed_ips(&self) -> Vec<String> {
-        self.servers.keys().cloned().collect()
+    pub fn allowed_servers(&self) -> Vec<(String, String)> {
+        self.servers.iter()
+            .map(|(ip, info)| (ip.clone(), info.alias.clone()))
+            .collect()
     }
 }
