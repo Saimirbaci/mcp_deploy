@@ -1,6 +1,7 @@
 mod config;
 mod ssh;
 mod mcp;
+mod diff;
 
 use std::io::Read;
 

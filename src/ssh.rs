@@ -55,6 +55,37 @@ pub fn read_remote_file(target: &str, remote_path: &str, config: &Config) -> Res
     Ok(content)
 }
 
+/// Read a remote file, returning `Ok(None)` when the file does not exist.
+///
+/// Used to build a diff preview for `write_remote_file`: a missing file is a
+/// valid "create new file" case rather than an error, while genuine failures
+/// (permissions, connectivity) still surface as errors.
+pub fn read_remote_file_if_exists(
+    target: &str,
+    remote_path: &str,
+    config: &Config,
+) -> Result<Option<String>> {
+    let (ip, server_info) = config.get_server_by_target(target)
+        .ok_or_else(|| anyhow!("Target {} not found", target))?;
+
+    let tcp = TcpStream::connect(format!("{}:22", ip))?;
+    let mut sess = Session::new()?;
+    sess.set_tcp_stream(tcp);
+    sess.handshake()?;
+    sess.userauth_pubkey_file(&server_info.user, None, Path::new(&server_info.key_path), None)?;
+
+    let sftp = sess.sftp().context("Failed to start SFTP session")?;
+    match sftp.stat(Path::new(remote_path)) {
+        Ok(_) => {}
+        Err(_) => return Ok(None),
+    }
+
+    let mut file = sftp.open(Path::new(remote_path)).context("Failed to open remote file")?;
+    let mut content = String::new();
+    file.read_to_string(&mut content).context("Failed to read remote file content")?;
+    Ok(Some(content))
+}
+
 pub fn write_remote_file(target: &str, remote_path: &str, content: &str, config: &Config) -> Result<()> {
     let (ip, server_info) = config.get_server_by_target(target)
         .ok_or_else(|| anyhow!("Target {} not found", target))?;
@@ -130,8 +161,11 @@ pub fn list_db_tables(target: &str, config: &Config) -> Result<String> {
 
     run_ssh_command(target, &psql_cmd, config)
 }
-pub fn update_remote_env_file(target: &str, remote_path: &str, key: &str, value: &str, config: &Config) -> Result<()> {
-    let content = read_remote_file(target, remote_path, config)?;
+/// Compute the new contents of an env file after setting `key` to `value`,
+/// without performing any I/O. An existing assignment for `key` is replaced in
+/// place; otherwise the assignment is appended. Returns the new content and
+/// whether an existing key was updated (`true`) versus added (`false`).
+pub fn compute_env_update(content: &str, key: &str, value: &str) -> (String, bool) {
     let mut lines: Vec<String> = content.lines().map(|l| l.to_string()).collect();
     let mut found = false;
     let new_line = format!("{}={}", key, value);
@@ -151,6 +185,41 @@ pub fn update_remote_env_file(target: &str, remote_path: &str, key: &str, value:
         lines.push(new_line);
     }
 
-    let new_content = lines.join("\n");
+    (lines.join("\n"), found)
+}
+
+pub fn update_remote_env_file(target: &str, remote_path: &str, key: &str, value: &str, config: &Config) -> Result<()> {
+    let content = read_remote_file_if_exists(target, remote_path, config)?.unwrap_or_default();
+    let (new_content, _updated) = compute_env_update(&content, key, value);
     write_remote_file(target, remote_path, &new_content, config)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn compute_env_update_replaces_existing_key_in_place() {
+        let content = "FOO=1\nAPI_KEY=old\nBAR=2";
+        let (new_content, updated) = compute_env_update(content, "API_KEY", "new");
+        assert!(updated);
+        assert_eq!(new_content, "FOO=1\nAPI_KEY=new\nBAR=2");
+    }
+
+    #[test]
+    fn compute_env_update_appends_missing_key() {
+        let content = "FOO=1";
+        let (new_content, updated) = compute_env_update(content, "API_KEY", "new");
+        assert!(!updated);
+        assert_eq!(new_content, "FOO=1\nAPI_KEY=new");
+    }
+
+    #[test]
+    fn compute_env_update_does_not_match_key_prefix() {
+        // API_KEY_EXTRA must not be mistaken for API_KEY.
+        let content = "API_KEY_EXTRA=keep";
+        let (new_content, updated) = compute_env_update(content, "API_KEY", "new");
+        assert!(!updated);
+        assert_eq!(new_content, "API_KEY_EXTRA=keep\nAPI_KEY=new");
+    }
 }
