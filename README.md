@@ -97,13 +97,40 @@ Or specify a custom config path:
 6. **`deploy_secret_to_server`**: Injects a secret from your local vault into a remote `.env` file.
    - **Arguments**: `target`, `remote_env_path`, `env_key`, `local_secret_name`
 
+### The Secret Vault (Encrypted at Rest in the macOS Keychain)
+Secrets are stored in the **macOS Keychain**, so they are encrypted at rest and
+access is gated by the operating system — values are never written to disk as
+plaintext.
+
+Manage the vault with the `secret` subcommand. Values are read from **stdin**,
+never passed as arguments, so they don't leak into shell history or the process
+table:
+
+```bash
+# Add or update a secret (the value is read from stdin)
+printf 'sk_live_...' | mcp_deploy secret add StripeProdKey
+
+# List the names stored in the vault (values are never printed)
+mcp_deploy secret list
+
+# Remove a secret
+mcp_deploy secret remove StripeProdKey
+```
+
+Use `--server <alias_or_ip>` to target a server-specific vault when a
+`secrets_path` is configured for that server; otherwise the shared default vault
+is used.
+
+**Migration**: if a legacy plaintext `~/.remote_connections/mcp_secrets.json`
+file exists, it is imported into the Keychain automatically on first access and
+the plaintext file is renamed to `*.json.migrated` (delete it once verified).
+
 ### Blind Secret Injection (Ultra-Secure)
-This tool allows you to manage production secrets without Claude ever seeing them:
-1. Create a file at `~/.remote_connections/mcp_secrets.json` on your Mac.
-2. Store your secrets there: `{"StripeProdKey": "sk_live_..."}`.
-3. Tell Claude: *"Deploy the 'StripeProdKey' to the beta server as 'STRIPE_SECRET'."*
-4. The MCP server fetches the value locally and pushes it to the server over SSH.
-5. **The secret never appears in the Claude chat history or logs.**
+This lets you manage production secrets without Claude ever seeing them:
+1. Add your secret to the vault: `printf 'sk_live_...' | mcp_deploy secret add StripeProdKey`.
+2. Tell Claude: *"Deploy the 'StripeProdKey' to the beta server as 'STRIPE_SECRET'."*
+3. The MCP server fetches the value locally from the Keychain and pushes it to the server over SSH.
+4. **The secret never appears in the Claude chat history or logs.**
 
 - **Agent Isolation**: Agents only provide the IP and the command. They never see the SSH keys or the usernames.
 - **Boundary Control**: If an IP is not in the configuration file, the tool will refuse to connect, preventing unauthorized lateral movement.
