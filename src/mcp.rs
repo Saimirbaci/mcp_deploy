@@ -1,10 +1,19 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::io::{self, BufRead, Write};
-use crate::config::{Config, Secrets};
+use crate::config::{self, Config, Secrets};
+use crate::scrubber;
 use crate::ssh;
 use anyhow::Result;
 use tracing::error;
+
+/// Scrubs secret material out of a tool's textual output before it is returned
+/// to the agent. Combines the target's known vault values with format-based
+/// pattern matching (see [`crate::scrubber`]).
+fn scrub_for_target(config: &Config, target: &str, output: &str) -> String {
+    let known_secrets = config::known_secret_values(config, target);
+    scrubber::scrub_output(output, &known_secrets)
+}
 
 #[derive(Debug, Deserialize)]
 struct JsonRpcRequest {
@@ -319,7 +328,7 @@ fn handle_request(req: JsonRpcRequest, config: &Config) -> JsonRpcResponse {
                                 "content": [
                                     {
                                         "type": "text",
-                                        "text": output
+                                        "text": scrub_for_target(config, target, &output)
                                     }
                                 ]
                             })),
@@ -363,7 +372,7 @@ fn handle_request(req: JsonRpcRequest, config: &Config) -> JsonRpcResponse {
                                     "content": [
                                         {
                                             "type": "text",
-                                            "text": content
+                                            "text": scrub_for_target(config, target, &content)
                                         }
                                     ]
                                 })),
@@ -425,7 +434,7 @@ fn handle_request(req: JsonRpcRequest, config: &Config) -> JsonRpcResponse {
                                 "content": [
                                     {
                                         "type": "text",
-                                        "text": output
+                                        "text": scrub_for_target(config, target, &output)
                                     }
                                 ]
                             })),
@@ -454,7 +463,7 @@ fn handle_request(req: JsonRpcRequest, config: &Config) -> JsonRpcResponse {
                                 "content": [
                                     {
                                         "type": "text",
-                                        "text": output
+                                        "text": scrub_for_target(config, target, &output)
                                     }
                                 ]
                             })),

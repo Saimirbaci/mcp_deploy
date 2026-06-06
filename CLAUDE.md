@@ -77,3 +77,4 @@ The codebase likely follows typical Rust binary organization with command-line a
 - **Never** disable the configuration validation
 - **Never** modify the config file directly while the server is running for critical changes (use hot-reload for non-critical updates only)
 - **Never** weaken or bypass `command_guard::validate_command` — every remote command (CLI and `run_command`) must pass the secret/credential denylist. Use the `deploy_secret` tools to manage secrets instead of reading them via shell commands.
+- **Never** return remote data output to the agent without passing it through `scrubber::scrub_output` — every data-bearing tool (`run_command`, `read_remote_file`, `query_database`, `list_db_tables`, and the CLI) must scrub secrets out of its output so they never reach chat history or logs.
