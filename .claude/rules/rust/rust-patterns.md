@@ -73,3 +73,32 @@ two-phase: a preview call returns a unified diff plus a deterministic
 - **Never reveal secret values in a diff.** Redact env values to `<redacted>`
   before rendering (`diff::redact_env_value`), and match env keys exactly (not
   by substring) so `MY_API_KEY` is never treated as `API_KEY`.
+
+## Tamper-Evident Audit Log (`src/audit.rs`)
+Every `tools/call` handled by the MCP server is appended to an append-only,
+SHA-256 hash-chained log that lives in a file separate from the stderr
+`tracing` stream (default: `audit.log` alongside the config). It is a security
+artifact, never a secret store.
+- **Record names, never values.** Audit entries carry secret *names* and a
+  value-free `action` description; secret values must never be passed to
+  `AuditLog::record`. Build entry fields with `describe_tool_call` in `mcp.rs`,
+  which knows each tool's value-free shape — extend it when adding a tool.
+- **Audit every tool call, success or failure.** Record once at the single
+  call site after the tool result is computed; derive success from
+  `is_success` (no JSON-RPC error and no `isError` flag).
+- **Auditing must never break the request.** A failed log append is logged via
+  `error!` and swallowed — the tool result is still returned to the caller.
+- **Hash chain = tamper evidence.** Each entry stores `prev_hash` plus a hash
+  over its own fields; the first entry chains from `GENESIS_HASH`. Keep
+  `compute_hash` pure and I/O-free so the writer and `verify_chain` share
+  identical logic, and mix the `SEP` byte between fields so adjacent fields
+  can't collide into the same digest input.
+- **Continue the chain across restarts.** `AuditLog::open` reads existing
+  entries and resumes from the last hash/seq; guard mutable chain state
+  (`last_hash`, `next_seq`) behind a single `Mutex` so concurrent records stay
+  ordered and correctly linked.
+- **Fail loud on corruption.** `read_entries` treats a missing file as empty
+  but a present-but-unparseable line as a hard error, so corruption surfaces
+  instead of being silently skipped. `verify_chain` checks contiguous seq from
+  0, `prev_hash` linkage, and recomputed hashes; expose it via
+  `mcp_deploy audit verify` / `show`.
