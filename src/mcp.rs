@@ -287,7 +287,32 @@ fn handle_request(req: JsonRpcRequest, config: &Config) -> JsonRpcResponse {
                 "run_command" => {
                     let target = arguments["target"].as_str().unwrap_or("");
                     let command = arguments["command"].as_str().unwrap_or("");
-                    
+
+                    // Block secret/credential exfiltration and enforce any
+                    // per-server command allowlist before touching the network.
+                    let allowed_prefixes = config
+                        .get_server_by_target(target)
+                        .and_then(|(_ip, info)| info.allowed_command_prefixes.clone());
+                    if let Err(e) = crate::command_guard::validate_command(
+                        command,
+                        allowed_prefixes.as_deref(),
+                    ) {
+                        return JsonRpcResponse {
+                            jsonrpc: "2.0".to_string(),
+                            result: Some(json!({
+                                "isError": true,
+                                "content": [
+                                    {
+                                        "type": "text",
+                                        "text": format!("{}", e)
+                                    }
+                                ]
+                            })),
+                            error: None,
+                            id,
+                        };
+                    }
+
                     match ssh::run_ssh_command(target, command, config) {
                         Ok(output) => (
                             Some(json!({

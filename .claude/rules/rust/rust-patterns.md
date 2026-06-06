@@ -7,6 +7,7 @@ src/
 ├── mcp/                 # MCP server implementation
 ├── ssh/                 # SSH connection and command execution
 ├── config/              # Configuration loading and validation
+├── command_guard.rs     # Validates remote commands (secret denylist + allowlist)
 └── error.rs             # Central error type using anyhow
 ```
 
@@ -53,3 +54,25 @@ impl ServerConfig {
 - Validate all IPs against configured whitelist
 - Fail closed: deny by default if whitelist check fails
 - Sanitize command output before returning to caller
+
+### Command Guard Pattern (`src/command_guard.rs`)
+- Validate every remote command with `command_guard::validate_command(command, allowed_prefixes)`
+  before it reaches the network. Call it in BOTH entry points: the `Cli` arm in
+  `main.rs` and the `run_command` handler in `mcp.rs`. MCP errors are returned as an
+  `isError` result, not by propagating `?`.
+- Two enforcement layers, applied in order:
+  1. **Global denylist (always on, cannot be overridden by allowlist):**
+     - Sensitive substrings matched case-insensitively anywhere in the command
+       (catches pipes/chains like `cat ~/.ssh/id_rsa | base64`): `.env`, `.ssh/`,
+       `id_rsa`/`id_ed25519`, `*.pem`/`*.ppk`, `.aws/credentials`, `.git-credentials`,
+       `.kube/config`, `/etc/shadow`, pasted `-----begin` PEM blocks, etc.
+     - Environment-dumping programs (`env`, `printenv`) matched as whole tokens after
+       normalizing shell separators (`| & ; \`( ) < >`) to whitespace, so `ls && env`
+       and `$(printenv)` are caught while `environment.txt` is NOT falsely flagged.
+  2. **Optional per-server allowlist:** `ServerInfo.allowed_command_prefixes`
+     (`#[serde(default)]`, `Option<Vec<String>>`). When present and non-empty, the
+     command must `starts_with` one of the prefixes (fail-closed); when absent/empty,
+     only the denylist applies.
+- When adding a new sensitive file/credential type, extend `DENY_SUBSTRINGS`; when
+  adding an environment-dumping program, extend `DENY_COMMAND_WORDS`. Add a matching
+  `#[cfg(test)]` case for both the blocked input and a benign near-miss.

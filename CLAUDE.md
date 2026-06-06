@@ -68,6 +68,7 @@ The codebase likely follows typical Rust binary organization with command-line a
 - **Config path**: Uses `$HOME/.remote_connections/mcp_config.json` by default; override with `--config`
 - **SSH keys**: Must exist locally; private keys are never exposed to AI agents
 - **Aliases**: Servers can be referenced by alias (from config) or IP address
+- **Command allowlist** (optional): A server entry may set `allowed_command_prefixes` (array of strings). When present and non-empty, `run_command` only runs commands starting with one of those prefixes (fail-closed), on top of the always-on secret denylist
 
 ## Never Do
 
@@ -75,3 +76,4 @@ The codebase likely follows typical Rust binary organization with command-line a
 - **Never** execute on IPs not defined in the configuration whitelist
 - **Never** disable the configuration validation
 - **Never** modify the config file directly while the server is running for critical changes (use hot-reload for non-critical updates only)
+- **Never** weaken or bypass `command_guard::validate_command` — every remote command (CLI and `run_command`) must pass the secret/credential denylist. Use the `deploy_secret` tools to manage secrets instead of reading them via shell commands.
