@@ -9,7 +9,13 @@
         "name": "auto_finanza",
         "password": "your_password",
         "readonly": false
-      }
+      },
+      "allowed_command_prefixes": [
+        "ls",
+        "tail -n",
+        "systemctl status",
+        "uptime"
+      ]
     }
   }
 }

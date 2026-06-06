@@ -89,6 +89,11 @@ Or specify a custom config path:
 1. **`list_allowed_servers`**: Returns the list of IP addresses and Aliases the agent is allowed to connect to.
 2. **`run_command`**: Executes a command on a remote server.
    - **Arguments**: `target` (string), `command` (string)
+   - **Security**: Commands are screened before execution. Reads of `.env` files,
+     SSH/private keys (`id_rsa`, `*.pem`, `~/.ssh/...`), and credential stores
+     (`~/.aws/credentials`, `~/.git-credentials`, `/etc/shadow`, etc.) are
+     blocked, as are environment-dumping commands (`env`, `printenv`). Servers
+     may additionally define an `allowed_command_prefixes` allowlist (see below).
 3. **`read_remote_file`**: Reads a file from the remote server using SFTP.
    - **Arguments**: `target` (string), `path` (string)
 4. **`write_remote_file`**: Writes/Overwrites a file on the remote server using SFTP.
@@ -140,6 +145,17 @@ This lets you manage production secrets without Claude ever seeing them:
 2. Tell Claude: *"Deploy the 'StripeProdKey' to the beta server as 'STRIPE_SECRET'."*
 3. The MCP server fetches the value locally from the Keychain and pushes it to the server over SSH.
 4. **The secret never appears in the Claude chat history or logs.**
+
+### Command Allowlist (Optional)
+Each server entry may define `allowed_command_prefixes`, an array of permitted
+command prefixes. When present and non-empty, `run_command` will only execute
+commands that begin with one of these prefixes (fail-closed), in addition to the
+global secret-exfiltration denylist. Omit the field (or leave it empty) to allow
+any non-denylisted command.
+
+```json
+"allowed_command_prefixes": ["ls", "tail -n", "systemctl status", "uptime"]
+```
 
 - **Agent Isolation**: Agents only provide the IP and the command. They never see the SSH keys or the usernames.
 - **Boundary Control**: If an IP is not in the configuration file, the tool will refuse to connect, preventing unauthorized lateral movement.

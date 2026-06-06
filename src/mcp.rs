@@ -1,6 +1,7 @@
 use crate::audit::AuditLog;
-use crate::config::{Config, Secrets};
+use crate::config::{self, Config, Secrets};
 use crate::diff;
+use crate::scrubber;
 use crate::ssh;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -29,6 +30,14 @@ fn error_result(text: String) -> (Option<Value>, Option<Value>) {
         Some(json!({ "isError": true, "content": [{ "type": "text", "text": text }] })),
         None,
     )
+}
+
+/// Scrubs secret material out of a tool's textual output before it is returned
+/// to the agent. Combines the target's known vault values with format-based
+/// pattern matching (see [`crate::scrubber`]).
+fn scrub_for_target(config: &Config, target: &str, output: &str) -> String {
+    let known_secrets = config::known_secret_values(config, target);
+    scrubber::scrub_output(output, &known_secrets)
 }
 
 #[derive(Debug, Deserialize)]
@@ -419,13 +428,38 @@ fn handle_request(
                     let target = arguments["target"].as_str().unwrap_or("");
                     let command = arguments["command"].as_str().unwrap_or("");
 
+                    // Block secret/credential exfiltration and enforce any
+                    // per-server command allowlist before touching the network.
+                    let allowed_prefixes = config
+                        .get_server_by_target(target)
+                        .and_then(|(_ip, info)| info.allowed_command_prefixes.clone());
+                    if let Err(e) = crate::command_guard::validate_command(
+                        command,
+                        allowed_prefixes.as_deref(),
+                    ) {
+                        return JsonRpcResponse {
+                            jsonrpc: "2.0".to_string(),
+                            result: Some(json!({
+                                "isError": true,
+                                "content": [
+                                    {
+                                        "type": "text",
+                                        "text": format!("{}", e)
+                                    }
+                                ]
+                            })),
+                            error: None,
+                            id,
+                        };
+                    }
+
                     match ssh::run_ssh_command(target, command, config) {
                         Ok(output) => (
                             Some(json!({
                                 "content": [
                                     {
                                         "type": "text",
-                                        "text": output
+                                        "text": scrub_for_target(config, target, &output)
                                     }
                                 ]
                             })),
@@ -469,7 +503,7 @@ fn handle_request(
                                     "content": [
                                         {
                                             "type": "text",
-                                            "text": content
+                                            "text": scrub_for_target(config, target, &content)
                                         }
                                     ]
                                 })),
@@ -557,7 +591,7 @@ fn handle_request(
                                 "content": [
                                     {
                                         "type": "text",
-                                        "text": output
+                                        "text": scrub_for_target(config, target, &output)
                                     }
                                 ]
                             })),
@@ -586,7 +620,7 @@ fn handle_request(
                                 "content": [
                                     {
                                         "type": "text",
-                                        "text": output
+                                        "text": scrub_for_target(config, target, &output)
                                     }
                                 ]
                             })),

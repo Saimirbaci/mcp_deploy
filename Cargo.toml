@@ -16,3 +16,4 @@ notify = "6.1.1"
 keyring = { version = "3", features = ["apple-native"] }
 similar = "2"
 sha2 = "0.10"
+regex = "1.10"

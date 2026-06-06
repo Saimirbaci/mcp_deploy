@@ -3,6 +3,8 @@ mod config;
 mod diff;
 mod mcp;
 mod ssh;
+mod command_guard;
+mod scrubber;
 
 use std::io::Read;
 
@@ -244,8 +246,13 @@ fn main() -> Result<()> {
         Commands::Cli { ip, command } => {
             let cfg = Config::load(&config_path)
                 .context(format!("Failed to load config from {}", config_path))?;
+            let allowed_prefixes = cfg
+                .get_server_by_target(&ip)
+                .and_then(|(_ip, info)| info.allowed_command_prefixes.clone());
+            command_guard::validate_command(&command, allowed_prefixes.as_deref())?;
             let output = ssh::run_ssh_command(&ip, &command, &cfg)?;
-            println!("{}", output);
+            let known_secrets = config::known_secret_values(&cfg, &ip);
+            println!("{}", scrubber::scrub_output(&output, &known_secrets));
         }
         Commands::Secret { action } => {
             run_secret_action(&config_path, action)?;

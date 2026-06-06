@@ -20,6 +20,11 @@ pub struct ServerInfo {
     pub db_config: Option<DbConfig>,
     pub default_env_path: Option<String>,
     pub secrets_path: Option<String>,
+    /// Optional allowlist of permitted command prefixes for this server. When
+    /// present and non-empty, `run_command` only executes commands that start
+    /// with one of these prefixes (in addition to the global secret denylist).
+    #[serde(default)]
+    pub allowed_command_prefixes: Option<Vec<String>>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -151,6 +156,28 @@ impl Secrets {
 
     pub fn get(&self, name: &str) -> Option<String> {
         self.data.get(name).cloned()
+    }
+
+    pub fn values(&self) -> Vec<String> {
+        self.data.values().cloned().collect()
+    }
+}
+
+/// Loads the literal vault secret values associated with a target server so they
+/// can be scrubbed out of tool output. Failures (missing/unreadable vault) yield
+/// an empty list — scrubbing then falls back to pattern matching only.
+pub fn known_secret_values(config: &Config, target: &str) -> Vec<String> {
+    let Some((_ip, info)) = config.get_server_by_target(target) else {
+        return Vec::new();
+    };
+    let home = std::env::var("HOME").unwrap_or_default();
+    let secrets_path = info
+        .secrets_path
+        .clone()
+        .unwrap_or_else(|| format!("{}/.remote_connections/mcp_secrets.json", home));
+    match Secrets::load(&secrets_path) {
+        Ok(s) => s.values(),
+        Err(_) => Vec::new(),
     }
 }
 
