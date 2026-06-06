@@ -1,8 +1,8 @@
+use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
-use anyhow::{Context, Result};
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct DbConfig {
@@ -72,9 +72,7 @@ impl Secrets {
                     .context("Failed to parse secrets stored in the OS keychain")?;
                 Ok(Secrets { data, account })
             }
-            Err(keyring::Error::NoEntry) => {
-                Self::migrate_or_empty(path.as_ref(), account)
-            }
+            Err(keyring::Error::NoEntry) => Self::migrate_or_empty(path.as_ref(), account),
             Err(e) => Err(anyhow::anyhow!(
                 "Failed to read secrets from the OS keychain: {}",
                 e
@@ -86,7 +84,10 @@ impl Secrets {
     /// plaintext file if present, otherwise return an empty vault.
     fn migrate_or_empty(path: &Path, account: String) -> Result<Self> {
         if !path.exists() {
-            return Ok(Secrets { data: HashMap::new(), account });
+            return Ok(Secrets {
+                data: HashMap::new(),
+                account,
+            });
         }
 
         let content = fs::read_to_string(path)?;
@@ -155,10 +156,9 @@ impl Secrets {
 
 impl Config {
     pub fn load<P: AsRef<Path>>(path: P) -> Result<Self> {
-        let content = fs::read_to_string(path)
-            .context("Failed to read config file")?;
-        let config: Config = serde_json::from_str(&content)
-            .context("Failed to parse config JSON")?;
+        let content = fs::read_to_string(path).context("Failed to read config file")?;
+        let config: Config =
+            serde_json::from_str(&content).context("Failed to parse config JSON")?;
         Ok(config)
     }
 
@@ -167,19 +167,20 @@ impl Config {
         if let Some(info) = self.servers.get(target) {
             return Some((target.to_string(), info));
         }
-        
+
         // Then try to find by alias
         for (ip, info) in &self.servers {
             if info.alias == target {
                 return Some((ip.clone(), info));
             }
         }
-        
+
         None
     }
 
     pub fn allowed_servers(&self) -> Vec<(String, String)> {
-        self.servers.iter()
+        self.servers
+            .iter()
             .map(|(ip, info)| (ip.clone(), info.alias.clone()))
             .collect()
     }
@@ -208,7 +209,10 @@ mod tests {
     fn test_get_and_list_names_operate_on_loaded_data() {
         let mut data = HashMap::new();
         data.insert("ApiKey".to_string(), "secret-value".to_string());
-        let secrets = Secrets { data, account: "test-account".to_string() };
+        let secrets = Secrets {
+            data,
+            account: "test-account".to_string(),
+        };
 
         assert_eq!(secrets.get("ApiKey"), Some("secret-value".to_string()));
         assert_eq!(secrets.get("Missing"), None);

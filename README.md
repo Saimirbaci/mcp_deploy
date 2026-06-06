@@ -9,6 +9,7 @@ A secure Model Context Protocol (MCP) server and CLI tool written in Rust for ex
 - **Dual Mode**: Works as both a standard CLI tool and an MCP server for AI integration.
 - **Discovery**: Exposes a tool for agents to list available servers.
 - **Hot-Reloading**: Automatically detects and applies changes to the configuration file without restarting the server.
+- **Tamper-Evident Audit Log**: Appends every tool call to an append-only, hash-chained log for security reviews and incident response.
 
 ## Prerequisites
 
@@ -143,6 +144,37 @@ This lets you manage production secrets without Claude ever seeing them:
 - **Agent Isolation**: Agents only provide the IP and the command. They never see the SSH keys or the usernames.
 - **Boundary Control**: If an IP is not in the configuration file, the tool will refuse to connect, preventing unauthorized lateral movement.
 - **Logging**: All logs are directed to `stderr`, keeping the MCP communication channel (`stdout`) clean and secure.
+
+## Tamper-Evident Audit Log
+
+Independently of the `stderr` `tracing` stream, the MCP server appends a record
+of **every** tool call to an append-only, hash-chained audit log. Each entry
+captures who (the OS user running the server), what (the tool and a value-free
+description of the action), when (timestamp), the target server, the **names**
+of any secrets involved (**never** their values), and whether the call
+succeeded.
+
+Each entry stores the SHA-256 hash of the previous entry plus a hash over its
+own fields, forming a chain. Editing, removing, or reordering any entry breaks
+the chain and is detected on verification — the log is an artifact for security
+reviews and incident response, not a secret store.
+
+### Location
+By default the log lives next to the config file (e.g.
+`~/.remote_connections/audit.log`).
+
+### Inspecting the log
+
+```bash
+# Verify the hash chain is intact (exits non-zero on tampering)
+mcp_deploy audit verify
+
+# Print a human-readable summary of recorded tool calls
+mcp_deploy audit show
+
+# Point at a specific log file
+mcp_deploy audit verify --path /path/to/audit.log
+```
 
 ## License
 MIT
