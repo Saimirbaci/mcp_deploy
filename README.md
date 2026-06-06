@@ -91,11 +91,19 @@ Or specify a custom config path:
 3. **`read_remote_file`**: Reads a file from the remote server using SFTP.
    - **Arguments**: `target` (string), `path` (string)
 4. **`write_remote_file`**: Writes/Overwrites a file on the remote server using SFTP.
-   - **Arguments**: `target` (string), `path` (string), `content` (string)
+   - **Arguments**: `target` (string), `path` (string), `content` (string), `confirm_token` (string, optional)
+   - **Dry-run preview**: Called without `confirm_token`, it performs no write and
+     instead returns a unified diff of what would change plus a `confirm_token`.
+     Call it again with the same `target`/`path`/`content` and that token to apply
+     the change. This prevents silently clobbering an existing file.
 5. **`list_local_secret_names`**: Lists the names (labels) of secrets stored in your local Mac vault.
    - **Note**: Claude never sees the values, only the labels.
 6. **`deploy_secret_to_server`**: Injects a secret from your local vault into a remote `.env` file.
-   - **Arguments**: `target`, `remote_env_path`, `env_key`, `local_secret_name`
+   - **Arguments**: `target`, `remote_env_path`, `env_key`, `local_secret_name`, `confirm_token` (optional)
+   - **Dry-run preview**: Like `write_remote_file`, the first call (without
+     `confirm_token`) returns a diff showing whether the key is added or updated
+     — the secret value is always **redacted** — plus a `confirm_token` that must
+     be passed back to apply the change.
 
 ### The Secret Vault (Encrypted at Rest in the macOS Keychain)
 Secrets are stored in the **macOS Keychain**, so they are encrypted at rest and
