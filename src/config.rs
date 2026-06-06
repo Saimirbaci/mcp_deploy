@@ -20,6 +20,11 @@ pub struct ServerInfo {
     pub db_config: Option<DbConfig>,
     pub default_env_path: Option<String>,
     pub secrets_path: Option<String>,
+    /// Optional allowlist of permitted command prefixes for this server. When
+    /// present and non-empty, `run_command` only executes commands that start
+    /// with one of these prefixes (in addition to the global secret denylist).
+    #[serde(default)]
+    pub allowed_command_prefixes: Option<Vec<String>>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
