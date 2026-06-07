@@ -1,11 +1,36 @@
-use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
-use std::io::{self, BufRead, Write};
+use crate::audit::AuditLog;
 use crate::config::{self, Config, Secrets};
+use crate::diff;
 use crate::scrubber;
 use crate::ssh;
 use anyhow::Result;
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
+use std::collections::HashSet;
+use std::io::{self, BufRead, Write};
 use tracing::error;
+
+/// In-memory set of confirmation tokens for write operations that have been
+/// previewed (dry-run) but not yet applied. A write is only carried out when a
+/// caller supplies a token present in this set, which guarantees the change was
+/// previewed before it touches a remote server.
+type PendingStore = Arc<Mutex<HashSet<String>>>;
+
+/// Build a successful text tool result.
+fn text_result(text: String) -> (Option<Value>, Option<Value>) {
+    (
+        Some(json!({ "content": [{ "type": "text", "text": text }] })),
+        None,
+    )
+}
+
+/// Build a tool result flagged as an error (MCP `isError`).
+fn error_result(text: String) -> (Option<Value>, Option<Value>) {
+    (
+        Some(json!({ "isError": true, "content": [{ "type": "text", "text": text }] })),
+        None,
+    )
+}
 
 /// Scrubs secret material out of a tool's textual output before it is returned
 /// to the agent. Combines the target's known vault values with format-based
@@ -34,26 +59,32 @@ struct JsonRpcResponse {
     id: Value,
 }
 
-use std::sync::{Arc, RwLock};
-use notify::{Watcher, RecursiveMode, EventKind};
+use notify::{EventKind, RecursiveMode, Watcher};
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex, RwLock};
 
-pub fn run_server(initial_config: Config, config_path: String) -> Result<()> {
+pub fn run_server(initial_config: Config, config_path: String, audit_path: String) -> Result<()> {
     let config = Arc::new(RwLock::new(initial_config));
-    
+    let pending: PendingStore = Arc::new(Mutex::new(HashSet::new()));
+    let audit = Arc::new(AuditLog::open(&audit_path)?);
+    error!("Audit log active at {}", audit_path);
+
     let config_for_watcher = Arc::clone(&config);
     let path_for_watcher = PathBuf::from(&config_path);
 
     // Setup file watcher
-    let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
-        match res {
+    let mut watcher =
+        notify::recommended_watcher(move |res: notify::Result<notify::Event>| match res {
             Ok(event) => {
                 if let EventKind::Modify(_) = event.kind {
                     match Config::load(&path_for_watcher) {
                         Ok(new_config) => {
                             if let Ok(mut w) = config_for_watcher.write() {
                                 *w = new_config;
-                                error!("Config reloaded successfully from {}", path_for_watcher.display());
+                                error!(
+                                    "Config reloaded successfully from {}",
+                                    path_for_watcher.display()
+                                );
                             }
                         }
                         Err(e) => error!("Failed to reload config: {}", e),
@@ -61,11 +92,12 @@ pub fn run_server(initial_config: Config, config_path: String) -> Result<()> {
                 }
             }
             Err(e) => error!("Watch error: {:?}", e),
-        }
-    })?;
+        })?;
 
     let watch_path = PathBuf::from(&config_path);
-    let watch_dir = watch_path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    let watch_dir = watch_path
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."));
     watcher.watch(watch_dir, RecursiveMode::NonRecursive)?;
 
     error!("MCP Server is ready and listening on stdin");
@@ -95,10 +127,13 @@ pub fn run_server(initial_config: Config, config_path: String) -> Result<()> {
 
                 error!("Handling request: {} (id: {:?})", req.method, req.id);
 
-                let current_config = config.read().map_err(|e| anyhow::anyhow!("Lock error: {}", e))?.clone();
-                let response = handle_request(req, &current_config);
+                let current_config = config
+                    .read()
+                    .map_err(|e| anyhow::anyhow!("Lock error: {}", e))?
+                    .clone();
+                let response = handle_request(req, &current_config, &pending, &audit);
                 let response_json = serde_json::to_string(&response)?;
-                
+
                 error!("Sending response for id {:?}", response.id);
                 writeln!(stdout, "{}", response_json)?;
                 stdout.flush()?;
@@ -112,7 +147,95 @@ pub fn run_server(initial_config: Config, config_path: String) -> Result<()> {
     Ok(())
 }
 
-fn handle_request(req: JsonRpcRequest, config: &Config) -> JsonRpcResponse {
+/// Extract value-free audit fields (target, action description, secret names)
+/// for a tool call. Secret *names* may appear here; secret *values* must never
+/// be included.
+fn describe_tool_call(tool_name: &str, arguments: &Value) -> (String, String, Vec<String>) {
+    let target = arguments["target"].as_str().unwrap_or("").to_string();
+    let dry_run_phase = |args: &Value| {
+        if args["confirm_token"].as_str().unwrap_or("").is_empty() {
+            "preview"
+        } else {
+            "apply"
+        }
+    };
+
+    let (action, secret_names): (String, Vec<String>) = match tool_name {
+        "run_command" => (
+            format!(
+                "run_command: {}",
+                arguments["command"].as_str().unwrap_or("")
+            ),
+            vec![],
+        ),
+        "read_remote_file" => (
+            format!(
+                "read_remote_file: {}",
+                arguments["path"].as_str().unwrap_or("")
+            ),
+            vec![],
+        ),
+        "write_remote_file" => (
+            format!(
+                "write_remote_file ({}): {}",
+                dry_run_phase(arguments),
+                arguments["path"].as_str().unwrap_or("")
+            ),
+            vec![],
+        ),
+        "query_database" => (
+            format!(
+                "query_database: {}",
+                arguments["query"].as_str().unwrap_or("")
+            ),
+            vec![],
+        ),
+        "list_db_tables" => ("list_db_tables".to_string(), vec![]),
+        "list_local_secret_names" => ("list_local_secret_names".to_string(), vec![]),
+        "list_allowed_servers" => ("list_allowed_servers".to_string(), vec![]),
+        "deploy_secret_to_server" => {
+            let env_key = arguments["env_key"].as_str().unwrap_or("");
+            let secret_name = arguments["local_secret_name"]
+                .as_str()
+                .unwrap_or("")
+                .to_string();
+            (
+                format!(
+                    "deploy_secret_to_server ({}): env_key={}",
+                    dry_run_phase(arguments),
+                    env_key
+                ),
+                if secret_name.is_empty() {
+                    vec![]
+                } else {
+                    vec![secret_name]
+                },
+            )
+        }
+        other => (other.to_string(), vec![]),
+    };
+
+    (target, action, secret_names)
+}
+
+/// Determine whether a tool result represents success: no JSON-RPC error and no
+/// `isError` flag on the tool result payload.
+fn is_success(result: &Option<Value>, error: &Option<Value>) -> bool {
+    if error.is_some() {
+        return false;
+    }
+    match result {
+        Some(v) => !v.get("isError").and_then(|b| b.as_bool()).unwrap_or(false),
+        None => true,
+    }
+}
+
+fn handle_request(
+    req: JsonRpcRequest,
+    config: &Config,
+    pending: &PendingStore,
+    audit: &AuditLog,
+) -> JsonRpcResponse {
     let id = req.id.unwrap_or(Value::Null);
     let (result, error) = match req.method.as_str() {
         "initialize" => (
@@ -126,7 +249,7 @@ fn handle_request(req: JsonRpcRequest, config: &Config) -> JsonRpcResponse {
                     "version": "0.1.0"
                 }
             })),
-            None
+            None,
         ),
         "tools/list" => (
             Some(json!({
@@ -177,7 +300,7 @@ fn handle_request(req: JsonRpcRequest, config: &Config) -> JsonRpcResponse {
                     },
                     {
                         "name": "write_remote_file",
-                        "description": "Writes content to a file on a remote server using SFTP. If the file exists, it will be overwritten.",
+                        "description": "Writes content to a file on a remote server using SFTP, overwriting any existing file. SAFETY: This is a two-step operation. Call it FIRST without 'confirm_token' to get a DRY-RUN unified diff of exactly what would change (no data is written). Then call it AGAIN with the SAME target/path/content plus the 'confirm_token' returned by the dry run to actually apply the write.",
                         "inputSchema": {
                             "type": "object",
                             "properties": {
@@ -192,6 +315,10 @@ fn handle_request(req: JsonRpcRequest, config: &Config) -> JsonRpcResponse {
                                 "content": {
                                     "type": "string",
                                     "description": "The text content to write to the file."
+                                },
+                                "confirm_token": {
+                                    "type": "string",
+                                    "description": "Optional. Leave empty for a dry-run preview. To apply the change, pass back the token returned by the preview along with identical target/path/content."
                                 }
                             },
                             "required": ["target", "path", "content"]
@@ -245,7 +372,7 @@ fn handle_request(req: JsonRpcRequest, config: &Config) -> JsonRpcResponse {
                     },
                     {
                         "name": "deploy_secret_to_server",
-                        "description": "Takes a secret from your local vault and injects it into a remote .env file. The secret value never leaves the MCP server's process except to travel over the secure SSH tunnel.",
+                        "description": "Takes a secret from your local vault and injects it into a remote .env file. The secret value never leaves the MCP server's process except to travel over the secure SSH tunnel. SAFETY: This is a two-step operation. Call it FIRST without 'confirm_token' to get a DRY-RUN diff showing whether the key will be added or updated (the secret value is redacted and never shown). Then call it AGAIN with identical arguments plus the returned 'confirm_token' to actually apply the change.",
                         "inputSchema": {
                             "type": "object",
                             "properties": {
@@ -264,6 +391,10 @@ fn handle_request(req: JsonRpcRequest, config: &Config) -> JsonRpcResponse {
                                 "local_secret_name": {
                                     "type": "string",
                                     "description": "The name of the secret in your local mcp_secrets.json vault."
+                                },
+                                "confirm_token": {
+                                    "type": "string",
+                                    "description": "Optional. Leave empty for a dry-run preview. To apply the change, pass back the token returned by the preview along with identical arguments."
                                 }
                             },
                             "required": ["target", "env_key", "local_secret_name"]
@@ -271,14 +402,14 @@ fn handle_request(req: JsonRpcRequest, config: &Config) -> JsonRpcResponse {
                     }
                 ]
             })),
-            None
+            None,
         ),
         "tools/call" => {
             let params = req.params.unwrap_or(Value::Null);
             let tool_name = params["name"].as_str().unwrap_or("");
             let arguments = &params["arguments"];
 
-            match tool_name {
+            let (call_result, call_error) = match tool_name {
                 "list_allowed_servers" => {
                     let servers = config.allowed_servers();
                     (
@@ -290,7 +421,7 @@ fn handle_request(req: JsonRpcRequest, config: &Config) -> JsonRpcResponse {
                                 }
                             ]
                         })),
-                        None
+                        None,
                     )
                 }
                 "run_command" => {
@@ -332,7 +463,7 @@ fn handle_request(req: JsonRpcRequest, config: &Config) -> JsonRpcResponse {
                                     }
                                 ]
                             })),
-                            None
+                            None,
                         ),
                         Err(e) => (
                             Some(json!({
@@ -344,14 +475,14 @@ fn handle_request(req: JsonRpcRequest, config: &Config) -> JsonRpcResponse {
                                     }
                                 ]
                             })),
-                            None
+                            None,
                         ),
                     }
                 }
                 "read_remote_file" => {
                     let target = arguments["target"].as_str().unwrap_or("");
                     let path = arguments["path"].as_str().unwrap_or("");
-                    
+
                     if path.contains(".env") {
                         (
                             Some(json!({
@@ -363,7 +494,7 @@ fn handle_request(req: JsonRpcRequest, config: &Config) -> JsonRpcResponse {
                                     }
                                 ]
                             })),
-                            None
+                            None,
                         )
                     } else {
                         match ssh::read_remote_file(target, path, config) {
@@ -376,7 +507,7 @@ fn handle_request(req: JsonRpcRequest, config: &Config) -> JsonRpcResponse {
                                         }
                                     ]
                                 })),
-                                None
+                                None,
                             ),
                             Err(e) => (
                                 Some(json!({
@@ -388,7 +519,7 @@ fn handle_request(req: JsonRpcRequest, config: &Config) -> JsonRpcResponse {
                                         }
                                     ]
                                 })),
-                                None
+                                None,
                             ),
                         }
                     }
@@ -397,37 +528,63 @@ fn handle_request(req: JsonRpcRequest, config: &Config) -> JsonRpcResponse {
                     let target = arguments["target"].as_str().unwrap_or("");
                     let path = arguments["path"].as_str().unwrap_or("");
                     let content = arguments["content"].as_str().unwrap_or("");
-                    
-                    match ssh::write_remote_file(target, path, content, config) {
-                        Ok(_) => (
-                            Some(json!({
-                                "content": [
-                                    {
-                                        "type": "text",
-                                        "text": format!("Successfully wrote to {}", path)
+                    let confirm_token = arguments["confirm_token"].as_str().unwrap_or("");
+
+                    let token = diff::change_token(target, path, content);
+
+                    if confirm_token.is_empty() {
+                        // Dry run: read the current file (if any) and show what would change.
+                        match ssh::read_remote_file_if_exists(target, path, config) {
+                            Ok(existing) => {
+                                let old = existing.clone().unwrap_or_default();
+                                let preview = diff::unified_diff(&old, content, path);
+                                if preview.is_empty() {
+                                    text_result(format!(
+                                        "No changes: {} already contains exactly this content. Nothing to write.",
+                                        path
+                                    ))
+                                } else {
+                                    if let Ok(mut p) = pending.lock() {
+                                        p.insert(token.clone());
                                     }
-                                ]
-                            })),
-                            None
-                        ),
-                        Err(e) => (
-                            Some(json!({
-                                "isError": true,
-                                "content": [
-                                    {
-                                        "type": "text",
-                                        "text": format!("Error writing file: {}", e)
+                                    let label = if existing.is_some() {
+                                        "Modify existing file"
+                                    } else {
+                                        "Create new file"
+                                    };
+                                    text_result(format!(
+                                        "DRY RUN — no changes written.\n{}: {}\n\n{}\nTo apply this exact change, call write_remote_file again with the same target/path/content plus confirm_token=\"{}\".",
+                                        label, path, preview, token
+                                    ))
+                                }
+                            }
+                            Err(e) => error_result(format!("Error previewing write: {}", e)),
+                        }
+                    } else {
+                        // Confirmation: only proceed if this exact change was previewed.
+                        let known = pending.lock().map(|p| p.contains(&token)).unwrap_or(false);
+                        if confirm_token != token || !known {
+                            error_result(
+                                "No matching preview for this write. Call write_remote_file without confirm_token first to review the diff, then confirm with the token it returns."
+                                    .to_string(),
+                            )
+                        } else {
+                            match ssh::write_remote_file(target, path, content, config) {
+                                Ok(_) => {
+                                    if let Ok(mut p) = pending.lock() {
+                                        p.remove(&token);
                                     }
-                                ]
-                            })),
-                            None
-                        ),
+                                    text_result(format!("Successfully wrote to {}", path))
+                                }
+                                Err(e) => error_result(format!("Error writing file: {}", e)),
+                            }
+                        }
                     }
                 }
                 "query_database" => {
                     let target = arguments["target"].as_str().unwrap_or("");
                     let query = arguments["query"].as_str().unwrap_or("");
-                    
+
                     match ssh::query_database(target, query, config) {
                         Ok(output) => (
                             Some(json!({
@@ -438,7 +595,7 @@ fn handle_request(req: JsonRpcRequest, config: &Config) -> JsonRpcResponse {
                                     }
                                 ]
                             })),
-                            None
+                            None,
                         ),
                         Err(e) => (
                             Some(json!({
@@ -450,13 +607,13 @@ fn handle_request(req: JsonRpcRequest, config: &Config) -> JsonRpcResponse {
                                     }
                                 ]
                             })),
-                            None
+                            None,
                         ),
                     }
                 }
                 "list_db_tables" => {
                     let target = arguments["target"].as_str().unwrap_or("");
-                    
+
                     match ssh::list_db_tables(target, config) {
                         Ok(output) => (
                             Some(json!({
@@ -467,7 +624,7 @@ fn handle_request(req: JsonRpcRequest, config: &Config) -> JsonRpcResponse {
                                     }
                                 ]
                             })),
-                            None
+                            None,
                         ),
                         Err(e) => (
                             Some(json!({
@@ -479,7 +636,7 @@ fn handle_request(req: JsonRpcRequest, config: &Config) -> JsonRpcResponse {
                                     }
                                 ]
                             })),
-                            None
+                            None,
                         ),
                     }
                 }
@@ -488,8 +645,10 @@ fn handle_request(req: JsonRpcRequest, config: &Config) -> JsonRpcResponse {
                     match config.get_server_by_target(target) {
                         Some((_ip, info)) => {
                             let home = std::env::var("HOME").unwrap_or_default();
-                            let secrets_path = info.secrets_path.clone().unwrap_or_else(|| format!("{}/.remote_connections/mcp_secrets.json", home));
-                            
+                            let secrets_path = info.secrets_path.clone().unwrap_or_else(|| {
+                                format!("{}/.remote_connections/mcp_secrets.json", home)
+                            });
+
                             match Secrets::load(&secrets_path) {
                                 Ok(s) => {
                                     let names = s.list_names();
@@ -502,7 +661,7 @@ fn handle_request(req: JsonRpcRequest, config: &Config) -> JsonRpcResponse {
                                                 }
                                             ]
                                         })),
-                                        None
+                                        None,
                                     )
                                 }
                                 Err(e) => (
@@ -515,8 +674,8 @@ fn handle_request(req: JsonRpcRequest, config: &Config) -> JsonRpcResponse {
                                             }
                                         ]
                                     })),
-                                    None
-                                )
+                                    None,
+                                ),
                             }
                         }
                         None => (
@@ -529,7 +688,7 @@ fn handle_request(req: JsonRpcRequest, config: &Config) -> JsonRpcResponse {
                                     }
                                 ]
                             })),
-                            None
+                            None,
                         ),
                     }
                 }
@@ -538,8 +697,10 @@ fn handle_request(req: JsonRpcRequest, config: &Config) -> JsonRpcResponse {
                     let remote_env_path = arguments["remote_env_path"].as_str().unwrap_or("");
                     let env_key = arguments["env_key"].as_str().unwrap_or("");
                     let local_secret_name = arguments["local_secret_name"].as_str().unwrap_or("");
-                    
+                    let confirm_token = arguments["confirm_token"].as_str().unwrap_or("");
+
                     match config.get_server_by_target(target) {
+                        None => error_result(format!("Target {} not found", target)),
                         Some((_ip, info)) => {
                             let path_opt = if remote_env_path.is_empty() {
                                 info.default_env_path.clone()
@@ -548,89 +709,137 @@ fn handle_request(req: JsonRpcRequest, config: &Config) -> JsonRpcResponse {
                             };
 
                             match path_opt {
-                                Some(path_to_use) => {
-                                    let home = std::env::var("HOME").unwrap_or_default();
-                                    let secrets_path = info.secrets_path.clone().unwrap_or_else(|| format!("{}/.remote_connections/mcp_secrets.json", home));
-                                    
-                                    match Secrets::load(&secrets_path) {
-                                        Ok(s) => {
-                                            match s.get(local_secret_name) {
-                                                Some(secret_value) => {
-                                                    match ssh::update_remote_env_file(target, &path_to_use, env_key, &secret_value, config) {
-                                                        Ok(_) => (
-                                                            Some(json!({
-                                                                "content": [
-                                                                    {
-                                                                        "type": "text",
-                                                                        "text": format!("Successfully deployed secret '{}' to {} on {}", local_secret_name, env_key, target)
-                                                                    }
-                                                                ]
-                                                            })),
-                                                            None
-                                                        ),
-                                                        Err(e) => (
-                                                            Some(json!({
-                                                                "isError": true,
-                                                                "content": [
-                                                                    {
-                                                                        "type": "text",
-                                                                        "text": format!("Failed to deploy secret: {}", e)
-                                                                    }
-                                                                ]
-                                                            })),
-                                                            None
-                                                        ),
-                                                    }
-                                                }
-                                                None => (
-                                                    Some(json!({
-                                                        "isError": true,
-                                                        "content": [
-                                                            {
-                                                                "type": "text",
-                                                                "text": format!("Secret '{}' not found in {}", local_secret_name, secrets_path)
-                                                            }
-                                                        ]
-                                                    })),
-                                                    None
-                                                )
-                                            }
-                                        }
-                                        Err(e) => (
-                                            Some(json!({
-                                                "isError": true,
-                                                "content": [
-                                                    {
-                                                        "type": "text",
-                                                        "text": format!("Failed to load secrets: {}", e)
-                                                    }
-                                                ]
-                                            })),
-                                            None
-                                        )
-                                    }
-                                }
                                 None => (
                                     None,
                                     Some(json!({
                                         "code": -32602,
                                         "message": "No remote_env_path provided and no default_env_path configured for this server."
-                                    }))
-                                )
+                                    })),
+                                ),
+                                Some(path_to_use) => {
+                                    let home = std::env::var("HOME").unwrap_or_default();
+                                    let secrets_path =
+                                        info.secrets_path.clone().unwrap_or_else(|| {
+                                            format!("{}/.remote_connections/mcp_secrets.json", home)
+                                        });
+
+                                    let secret_value = match Secrets::load(&secrets_path) {
+                                        Err(e) => {
+                                            return JsonRpcResponse {
+                                                jsonrpc: "2.0".to_string(),
+                                                result: error_result(format!(
+                                                    "Failed to load secrets: {}",
+                                                    e
+                                                ))
+                                                .0,
+                                                error: None,
+                                                id,
+                                            };
+                                        }
+                                        Ok(s) => s.get(local_secret_name),
+                                    };
+
+                                    let secret_value = match secret_value {
+                                        None => {
+                                            return JsonRpcResponse {
+                                                jsonrpc: "2.0".to_string(),
+                                                result: error_result(format!(
+                                                    "Secret '{}' not found in {}",
+                                                    local_secret_name, secrets_path
+                                                ))
+                                                .0,
+                                                error: None,
+                                                id,
+                                            };
+                                        }
+                                        Some(v) => v,
+                                    };
+
+                                    // Compute the resulting env contents so we can preview and
+                                    // tokenize the change without revealing the secret value.
+                                    match ssh::read_remote_file_if_exists(
+                                        target,
+                                        &path_to_use,
+                                        config,
+                                    ) {
+                                        Err(e) => error_result(format!(
+                                            "Failed to read remote env file: {}",
+                                            e
+                                        )),
+                                        Ok(existing) => {
+                                            let old = existing.unwrap_or_default();
+                                            let (new_content, updated) = ssh::compute_env_update(
+                                                &old,
+                                                env_key,
+                                                &secret_value,
+                                            );
+                                            let token = diff::change_token(
+                                                target,
+                                                &path_to_use,
+                                                &new_content,
+                                            );
+
+                                            if confirm_token.is_empty() {
+                                                let red_old = diff::redact_env_value(
+                                                    &old, env_key, "current",
+                                                );
+                                                let red_new = diff::redact_env_value(
+                                                    &new_content,
+                                                    env_key,
+                                                    "new secret value",
+                                                );
+                                                let preview = diff::unified_diff(
+                                                    &red_old,
+                                                    &red_new,
+                                                    &path_to_use,
+                                                );
+                                                if let Ok(mut p) = pending.lock() {
+                                                    p.insert(token.clone());
+                                                }
+                                                let action = if updated { "Update" } else { "Add" };
+                                                text_result(format!(
+                                                    "DRY RUN — no changes written.\n{} key '{}' in {} (secret value redacted).\n\n{}\nTo apply, call deploy_secret_to_server again with identical arguments plus confirm_token=\"{}\".",
+                                                    action, env_key, path_to_use, preview, token
+                                                ))
+                                            } else {
+                                                let known = pending
+                                                    .lock()
+                                                    .map(|p| p.contains(&token))
+                                                    .unwrap_or(false);
+                                                if confirm_token != token || !known {
+                                                    error_result(
+                                                        "No matching preview for this secret deployment (the remote file or secret may have changed). Call deploy_secret_to_server without confirm_token first to review the diff, then confirm with the token it returns."
+                                                            .to_string(),
+                                                    )
+                                                } else {
+                                                    match ssh::update_remote_env_file(
+                                                        target,
+                                                        &path_to_use,
+                                                        env_key,
+                                                        &secret_value,
+                                                        config,
+                                                    ) {
+                                                        Ok(_) => {
+                                                            if let Ok(mut p) = pending.lock() {
+                                                                p.remove(&token);
+                                                            }
+                                                            text_result(format!(
+                                                                "Successfully deployed secret '{}' to {} on {}",
+                                                                local_secret_name, env_key, target
+                                                            ))
+                                                        }
+                                                        Err(e) => error_result(format!(
+                                                            "Failed to deploy secret: {}",
+                                                            e
+                                                        )),
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
                             }
                         }
-                        None => (
-                            Some(json!({
-                                "isError": true,
-                                "content": [
-                                    {
-                                        "type": "text",
-                                        "text": format!("Target {} not found", target)
-                                    }
-                                ]
-                            })),
-                            None
-                        ),
                     }
                 }
                 _ => (
@@ -638,16 +847,27 @@ fn handle_request(req: JsonRpcRequest, config: &Config) -> JsonRpcResponse {
                     Some(json!({
                         "code": -32601,
                         "message": format!("Tool not found: {}", tool_name)
-                    }))
+                    })),
                 ),
+            };
+
+            // Append a tamper-evident audit record for every tool call. A
+            // failure to write the audit log is logged but never fails the
+            // request itself.
+            let (target, action, secret_names) = describe_tool_call(tool_name, arguments);
+            let success = is_success(&call_result, &call_error);
+            if let Err(e) = audit.record(tool_name, &target, &action, &secret_names, success) {
+                error!("Failed to write audit log entry for {}: {}", tool_name, e);
             }
+
+            (call_result, call_error)
         }
         _ => (
             None,
             Some(json!({
                 "code": -32601,
                 "message": "Method not found"
-            }))
+            })),
         ),
     };
 
