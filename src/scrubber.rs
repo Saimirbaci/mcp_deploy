@@ -106,7 +106,8 @@ mod tests {
 
     #[test]
     fn test_redacts_jwt() {
-        let jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NSJ9.dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
+        let jwt =
+            "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NSJ9.dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
         let out = scrub_output(&format!("token: {}", jwt), &[]);
         assert!(!out.contains(jwt));
         assert!(out.contains(REDACTED));

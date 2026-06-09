@@ -433,10 +433,9 @@ fn handle_request(
                     let allowed_prefixes = config
                         .get_server_by_target(target)
                         .and_then(|(_ip, info)| info.allowed_command_prefixes.clone());
-                    if let Err(e) = crate::command_guard::validate_command(
-                        command,
-                        allowed_prefixes.as_deref(),
-                    ) {
+                    if let Err(e) =
+                        crate::command_guard::validate_command(command, allowed_prefixes.as_deref())
+                    {
                         return JsonRpcResponse {
                             jsonrpc: "2.0".to_string(),
                             result: Some(json!({

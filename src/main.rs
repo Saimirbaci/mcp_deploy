@@ -1,10 +1,11 @@
 mod audit;
+mod command_guard;
 mod config;
 mod diff;
 mod mcp;
-mod ssh;
-mod command_guard;
 mod scrubber;
+mod sql_guard;
+mod ssh;
 
 use std::io::Read;
 
