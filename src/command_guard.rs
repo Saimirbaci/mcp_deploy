@@ -1,4 +1,4 @@
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 
 /// Substrings that indicate an attempt to read secrets, private keys, or
 /// credential stores. Matched case-insensitively anywhere in the command so
@@ -90,7 +90,9 @@ pub fn validate_command(command: &str, allowed_prefixes: Option<&[String]>) -> R
     // Layer 2: optional per-server allowlist of command prefixes.
     if let Some(prefixes) = allowed_prefixes
         && !prefixes.is_empty()
-        && !prefixes.iter().any(|prefix| trimmed.starts_with(prefix.trim()))
+        && !prefixes
+            .iter()
+            .any(|prefix| trimmed.starts_with(prefix.trim()))
     {
         return Err(anyhow!(
             "Security Error: command is not in the allowed command prefix \
@@ -153,7 +155,11 @@ mod tests {
 
     #[test]
     fn test_allowlist_enforced_when_configured() {
-        let prefixes = vec!["ls".to_string(), "tail ".to_string(), "systemctl status".to_string()];
+        let prefixes = vec![
+            "ls".to_string(),
+            "tail ".to_string(),
+            "systemctl status".to_string(),
+        ];
         assert!(validate_command("ls -la", Some(&prefixes)).is_ok());
         assert!(validate_command("systemctl status nginx", Some(&prefixes)).is_ok());
         assert!(validate_command("rm -rf /", Some(&prefixes)).is_err());

@@ -16,6 +16,22 @@
         "systemctl status",
         "uptime"
       ]
+    },
+    "[PROD_IP_ADDRESS]": {
+      "alias": "prod_server",
+      "user": "deploy",
+      "key_path": "/Users/user_name/.ssh/id_ed25519",
+      "db_config": {
+        "user": "readonly_user",
+        "name": "prod_db",
+        "password": null,
+        "readonly": true
+      },
+      "allowed_command_prefixes": [
+        "systemctl status",
+        "journalctl -n",
+        "uptime"
+      ]
     }
   }
 }

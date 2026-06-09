@@ -8,6 +8,7 @@ src/
 ├── ssh/                 # SSH connection and command execution
 ├── config/              # Configuration loading and validation
 ├── command_guard.rs     # Validates remote commands (secret denylist + allowlist)
+├── sql_guard.rs         # Validates DB queries are read-only (parser + structural check)
 ├── scrubber.rs          # Redacts secrets from tool output before returning to the agent
 └── error.rs             # Central error type using anyhow
 ```
@@ -146,3 +147,21 @@ artifact, never a secret store.
   Both replace with the `[REDACTED]` placeholder.
 - When adding a new secret format, extend `PATTERNS`; add a `#[cfg(test)]` case for
   both a matching secret and a benign near-miss that must NOT be redacted.
+
+### Read-Only DB Guard Pattern (`src/sql_guard.rs`)
+- **Never** use substring or `starts_with` matching to enforce read-only DB access — it is
+  trivially bypassed via leading comments (`/* */ DELETE`), CTEs (`WITH x AS (DELETE …) SELECT`),
+  or stacked statements (`SELECT 1;DROP TABLE t`).
+- Two enforcement layers, applied in order for every `query_database` call on a `readonly` server:
+  1. **SQL parser (defense-in-depth):** `sql_guard::validate_readonly_query(sql)` parses the
+     query with the PostgreSQL dialect (`sqlparser` crate). Rejects: more than one statement,
+     non-`Query`/non-`Explain` statement types, write-bearing CTE bodies. Fail-closed: a
+     parse error is also a rejection.
+  2. **Postgres session enforcement (primary):** `PGOPTIONS='-c default_transaction_read_only=on'`
+     is prepended to the `psql` invocation so the database itself rejects any write — including
+     those hidden inside volatile functions that the SQL parser cannot see.
+- The two layers are complementary: the parser gives fast, clear error messages before the query
+  hits the network; Postgres catches anything the parser misses at the enforcement boundary.
+- When adding a new allowed read-only statement type (e.g. `SHOW`), add it to
+  `check_statement_readonly` and add a matching `#[cfg(test)]` case for both the new allowed
+  form and a nearby write form that must still be rejected.

@@ -156,29 +156,10 @@ pub fn query_database(target: &str, query: &str, config: &Config) -> Result<Stri
         .as_ref()
         .ok_or_else(|| anyhow!("Database is not configured for target {}", target))?;
 
-    // Basic security check for readonly servers
     if db_config.readonly {
-        let q = query.trim().to_lowercase();
-        if !q.starts_with("select") {
-            return Err(anyhow!(
-                "Permission denied: Only SELECT queries are allowed on this server ({})",
-                target
-            ));
-        }
-        let destructive = [
-            "drop", "delete", "truncate", "update", "insert", "alter", "create", "grant",
-        ];
-        for keyword in destructive {
-            if q.contains(keyword) {
-                // Check if the keyword is not just part of a column name (simple check)
-                if q.contains(&format!(" {} ", keyword)) || q.contains(&format!("{};", keyword)) {
-                    return Err(anyhow!(
-                        "Permission denied: destructive keyword '{}' detected in readonly mode",
-                        keyword
-                    ));
-                }
-            }
-        }
+        // Defense-in-depth: parse the SQL and reject non-SELECT statements,
+        // stacked statements, and write-bearing CTEs before touching the network.
+        crate::sql_guard::validate_readonly_query(query)?;
     }
 
     let password_env = if let Some(pw) = &db_config.password {
@@ -187,11 +168,19 @@ pub fn query_database(target: &str, query: &str, config: &Config) -> Result<Stri
         String::new()
     };
 
-    // psql -h localhost -U user -d db -c "query"
-    // Use --csv for clean parsing or -P pager=off for raw table
+    // For readonly databases, set PGOPTIONS so Postgres itself enforces read-only
+    // at the session/transaction level. This catches writes hidden inside CTEs or
+    // volatile functions that the SQL parser cannot see.
+    let readonly_pgopts = if db_config.readonly {
+        "PGOPTIONS='-c default_transaction_read_only=on' "
+    } else {
+        ""
+    };
+
     let psql_cmd = format!(
-        "{}psql -h localhost -U {} -d {} -c \"{}\"",
+        "{}{}psql -h localhost -U {} -d {} -c \"{}\"",
         password_env,
+        readonly_pgopts,
         db_config.user,
         db_config.name,
         query.replace("\"", "\\\"")
