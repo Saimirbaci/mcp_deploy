@@ -1,5 +1,5 @@
 use crate::audit::AuditLog;
-use crate::config::{self, Config, Secrets};
+use crate::config::{self, Config, SecretStore};
 use crate::diff;
 use crate::http;
 use crate::scrubber;
@@ -515,8 +515,10 @@ fn handle_request(
                             // redacts the injected secret from error text; run the
                             // message through the pattern scrubber as well so no
                             // data-bearing output reaches the agent unscrubbed.
-                            let scrubbed =
-                                scrubber::scrub_output(&format!("Error calling service: {}", e), &[]);
+                            let scrubbed = scrubber::scrub_output(
+                                &format!("Error calling service: {}", e),
+                                &[],
+                            );
                             error_result(scrubbed)
                         }
                     }
@@ -745,7 +747,7 @@ fn handle_request(
                                 format!("{}/.remote_connections/mcp_secrets.json", home)
                             });
 
-                            match Secrets::load(&secrets_path) {
+                            match SecretStore::load(config.secret_backend(), &secrets_path) {
                                 Ok(s) => {
                                     let names = s.list_names();
                                     (
@@ -819,7 +821,10 @@ fn handle_request(
                                             format!("{}/.remote_connections/mcp_secrets.json", home)
                                         });
 
-                                    let secret_value = match Secrets::load(&secrets_path) {
+                                    let secret_value = match SecretStore::load(
+                                        config.secret_backend(),
+                                        &secrets_path,
+                                    ) {
                                         Err(e) => {
                                             return JsonRpcResponse {
                                                 jsonrpc: "2.0".to_string(),

@@ -8,9 +8,9 @@ mod scrubber;
 mod sql_guard;
 mod ssh;
 
-use std::io::Read;
+use std::io::{IsTerminal, Read};
 
-use crate::config::{Config, Secrets};
+use crate::config::{Config, SecretStore};
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
@@ -39,7 +39,7 @@ enum Commands {
         #[arg(short = 'x', long)]
         command: String,
     },
-    /// Manage the local secret vault (backed by the OS keychain)
+    /// Manage the local secret vault (JSON file or OS keychain, per config)
     Secret {
         #[command(subcommand)]
         action: SecretAction,
@@ -69,8 +69,11 @@ enum AuditAction {
 
 #[derive(Subcommand)]
 enum SecretAction {
-    /// Add or update a secret. The value is read from stdin, never from an
-    /// argument, so it does not leak into shell history or the process table.
+    /// Add or update a secret. The value is never taken from an argument (so it
+    /// cannot leak into shell history or the process table): when run in an
+    /// interactive terminal it is read with a no-echo prompt; when stdin is
+    /// piped, it is read from stdin so scripting still works.
+    #[command(alias = "set")]
     Add {
         /// The name (label) of the secret in the vault
         name: String,
@@ -85,6 +88,7 @@ enum SecretAction {
         server: Option<String>,
     },
     /// Remove a secret from the vault
+    #[command(alias = "rm")]
     Remove {
         /// The name (label) of the secret to remove
         name: String,
@@ -116,23 +120,33 @@ fn run_secret_action(config_path: &str, action: SecretAction) -> Result<()> {
     match action {
         SecretAction::Add { name, server } => {
             let path = resolve_secrets_path(&config, &server)?;
-            // Read the secret value from stdin to keep it out of argv and shell history.
-            let mut value = String::new();
-            std::io::stdin()
-                .read_to_string(&mut value)
-                .context("Failed to read secret value from stdin")?;
+            // Read the secret value without ever taking it from argv (which would
+            // leak into shell history and the process table). In an interactive
+            // terminal, use a no-echo prompt so the typed value is not shown;
+            // otherwise read piped stdin so scripted usage keeps working.
+            let value = if std::io::stdin().is_terminal() {
+                rpassword::prompt_password(format!("Value for secret '{}': ", name))
+                    .context("Failed to read secret value")?
+            } else {
+                let mut buf = String::new();
+                std::io::stdin()
+                    .read_to_string(&mut buf)
+                    .context("Failed to read secret value from stdin")?;
+                buf
+            };
             let value = value.trim_end_matches(['\n', '\r']);
             if value.is_empty() {
-                anyhow::bail!("No secret value provided on stdin");
+                anyhow::bail!("No secret value provided");
             }
 
-            let mut secrets = Secrets::load(&path)?;
+            let mut secrets = SecretStore::load(config.secret_backend(), &path)?;
             secrets.set(&name, value)?;
-            println!("Stored secret '{}' in the OS keychain.", name);
+            // Print only the name — never the value.
+            println!("Stored secret '{}' in the vault.", name);
         }
         SecretAction::List { server } => {
             let path = resolve_secrets_path(&config, &server)?;
-            let secrets = Secrets::load(&path)?;
+            let secrets = SecretStore::load(config.secret_backend(), &path)?;
             let mut names = secrets.list_names();
             names.sort();
             if names.is_empty() {
@@ -146,9 +160,9 @@ fn run_secret_action(config_path: &str, action: SecretAction) -> Result<()> {
         }
         SecretAction::Remove { name, server } => {
             let path = resolve_secrets_path(&config, &server)?;
-            let mut secrets = Secrets::load(&path)?;
+            let mut secrets = SecretStore::load(config.secret_backend(), &path)?;
             if secrets.remove(&name)? {
-                println!("Removed secret '{}' from the OS keychain.", name);
+                println!("Removed secret '{}' from the vault.", name);
             } else {
                 println!("Secret '{}' was not found in the vault.", name);
             }

@@ -177,39 +177,71 @@ the value lives in the local vault and is injected server-side:
 - The `services` block is optional and additive — existing `servers`-only
   configs continue to load unchanged.
 
-### The Secret Vault (Encrypted at Rest in the macOS Keychain)
-Secrets are stored in the **macOS Keychain**, so they are encrypted at rest and
-access is gated by the operating system — values are never written to disk as
-plaintext.
+### The Secret Vault (Selectable Backend)
+The local secret vault holds the API keys and tokens that the MCP server injects
+into SSH `.env` deploys and outbound `call_service_api` requests. The agent only
+ever sees secret **names** — values are read internally for injection and never
+returned to the chat or logs.
 
-Manage the vault with the `secret` subcommand. Values are read from **stdin**,
-never passed as arguments, so they don't leak into shell history or the process
-table:
+The storage backend is chosen by the top-level **`secret_backend`** config field:
+
+| `secret_backend` | Where secrets live | Encrypted at rest? |
+|------------------|--------------------|--------------------|
+| `json` (default) | A plaintext JSON map at `secrets_path` (default `~/.remote_connections/mcp_secrets.json`), written atomically with `0600` permissions | No — protected only by file permissions |
+| `keychain`       | The **macOS Keychain** under the service namespace `mcp_deploy_vault`, namespaced per vault by `secrets_path` | Yes — gated and encrypted by the OS |
+
+```json
+{
+  "secret_backend": "keychain",
+  "servers": { "...": { "...": "..." } }
+}
+```
+
+Omit `secret_backend` (or set `"json"`) to keep the original plaintext-JSON
+behavior, so **existing configs and vault files keep working unchanged**. Set
+`"keychain"` to store new (and migrated) secrets encrypted at rest — recommended
+for higher-value cloud credentials (Cloudflare, Resend, OpenRouter, GCP, …).
+
+Manage the vault with the `secret` subcommand (`set`/`rm` are accepted as aliases
+for `add`/`remove`). The value is **never** taken from a command-line argument:
+in an interactive terminal it is read with a **no-echo prompt** (the typed value
+is not shown), and when stdin is piped it is read from stdin so scripting still
+works. The value is never echoed, printed, or logged:
 
 ```bash
-# Add or update a secret (the value is read from stdin)
+# Add or update a secret — prompts without echoing when run interactively
+mcp_deploy secret add StripeProdKey
+
+# Or pipe the value in for scripted/CI use (no TTY → reads stdin)
 printf 'sk_live_...' | mcp_deploy secret add StripeProdKey
 
 # List the names stored in the vault (values are never printed)
 mcp_deploy secret list
 
 # Remove a secret
-mcp_deploy secret remove StripeProdKey
+mcp_deploy secret remove StripeProdKey   # alias: secret rm
 ```
 
 Use `--server <alias_or_ip>` to target a server-specific vault when a
 `secrets_path` is configured for that server; otherwise the shared default vault
-is used.
+is used. The same `secrets_path` is honored by both backends (as the file path
+for `json`, and as the keychain account namespace for `keychain`).
 
-**Migration**: if a legacy plaintext `~/.remote_connections/mcp_secrets.json`
-file exists, it is imported into the Keychain automatically on first access and
-the plaintext file is renamed to `*.json.migrated` (delete it once verified).
+**Migration to the keychain**: when `secret_backend` is `keychain` and a legacy
+plaintext file exists at the vault path, its contents are imported into the
+Keychain automatically on first access and the plaintext file is renamed to
+`*.json.migrated` (delete it once verified). Plain `json`-backend users are never
+touched by this migration.
+
+> The Foundation `call_service_api` tool reads its credentials through this same
+> vault (by the service's configured `secret_name`), so switching `secret_backend`
+> transparently changes where those credentials are stored too.
 
 ### Blind Secret Injection (Ultra-Secure)
 This lets you manage production secrets without Claude ever seeing them:
 1. Add your secret to the vault: `printf 'sk_live_...' | mcp_deploy secret add StripeProdKey`.
 2. Tell Claude: *"Deploy the 'StripeProdKey' to the beta server as 'STRIPE_SECRET'."*
-3. The MCP server fetches the value locally from the Keychain and pushes it to the server over SSH.
+3. The MCP server fetches the value locally from the configured vault backend (JSON file or Keychain) and pushes it to the server over SSH.
 4. **The secret never appears in the Claude chat history or logs.**
 
 ### Command Allowlist (Optional)
