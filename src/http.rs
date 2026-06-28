@@ -1,4 +1,4 @@
-use crate::config::{AuthScheme, Config, Secrets};
+use crate::config::{AuthScheme, Config, Secrets, ServiceInfo};
 use anyhow::{Context, Result, anyhow};
 use std::time::Duration;
 
@@ -62,6 +62,61 @@ fn parse_method(method: &str) -> Result<reqwest::Method> {
     }
 }
 
+/// Enforce a service's optional per-method allowlist (fail-closed). When the
+/// service declares a non-empty `allowed_methods`, the request method must match
+/// one of them (case-insensitive); otherwise any globally-permitted verb is
+/// allowed. This is the HTTP analogue of SSH's `allowed_command_prefixes`.
+fn validate_method_allowed(service: &ServiceInfo, method: &str) -> Result<()> {
+    if let Some(allowed) = &service.allowed_methods
+        && !allowed.is_empty()
+    {
+        let m = method.to_ascii_uppercase();
+        let ok = allowed.iter().any(|a| a.to_ascii_uppercase() == m);
+        if !ok {
+            return Err(anyhow!(
+                "HTTP method '{}' is not permitted for this service (allowed: {:?})",
+                m,
+                allowed
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Enforce path confinement (fail-closed). Always rejects `..` traversal
+/// segments so a caller cannot climb out of the intended API prefix. When the
+/// service declares a non-empty `allowed_path_prefixes`, the request path must
+/// start with one of them (leading slashes normalized on both sides).
+fn validate_path_allowed(service: &ServiceInfo, path: &str) -> Result<()> {
+    // Reject path traversal regardless of whether a prefix allowlist is set:
+    // `..` segments let the caller escape the configured base path.
+    if path.split('/').any(|seg| seg == "..") {
+        return Err(anyhow!("Request path must not contain '..' segments"));
+    }
+
+    if let Some(prefixes) = &service.allowed_path_prefixes
+        && !prefixes.is_empty()
+    {
+        let normalized = normalize_leading_slash(path);
+        let ok = prefixes
+            .iter()
+            .any(|p| normalized.starts_with(&normalize_leading_slash(p)));
+        if !ok {
+            return Err(anyhow!(
+                "Request path '{}' is not within an allowed path prefix for this service",
+                path
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Ensure a path/prefix string starts with exactly one leading slash so prefix
+/// comparison is not thrown off by a missing or doubled separator.
+fn normalize_leading_slash(s: &str) -> String {
+    format!("/{}", s.trim_start_matches('/'))
+}
+
 /// Compute how the credential is applied for a given auth scheme. Pure: takes
 /// the scheme and secret value and returns the header/query modification to make.
 fn auth_application(scheme: &AuthScheme, secret: &str) -> AuthApplication {
@@ -82,6 +137,14 @@ fn redact_secret(text: &str, secret: &str) -> String {
         return text.to_string();
     }
     text.replace(secret, "[REDACTED]")
+}
+
+/// Turn a `reqwest::Error` into a safe, secret-free message. The error's
+/// Display embeds the request URL, which for the Query auth scheme contains the
+/// credential; `without_url()` strips it and `redact_secret` removes any residual
+/// occurrence as belt-and-suspenders.
+fn sanitize_request_error(err: reqwest::Error, secret: &str) -> String {
+    redact_secret(&err.without_url().to_string(), secret)
 }
 
 /// Convert a caller-supplied JSON object of query parameters into string pairs.
@@ -134,6 +197,16 @@ pub fn call_service(
         )
     })?;
 
+    // Authorize the request BEFORE loading the credential: validate the verb
+    // against the global set and the service's per-method/per-path allowlists
+    // (fail-closed), analogous to SSH's allowed_command_prefixes and the DB
+    // read-only guard. Failing fast here also avoids any keychain access for a
+    // request that would be rejected anyway.
+    let http_method = parse_method(method)?;
+    validate_method_allowed(service, method)?;
+    validate_path_allowed(service, path)?;
+    let url = build_url(&service.base_url, path);
+
     // Load the credential value from the local vault. Never include the value in
     // any error message.
     let secrets_path = default_secrets_path()?;
@@ -147,11 +220,14 @@ pub fn call_service(
         )
     })?;
 
-    let http_method = parse_method(method)?;
-    let url = build_url(&service.base_url, path);
-
+    // Do NOT follow redirects. reqwest strips Authorization/Cookie on cross-host
+    // redirects but NOT custom headers (e.g. an `X-Api-Key` auth scheme) and not
+    // query-string credentials, so an open redirect on the allow-listed host
+    // could exfiltrate the injected secret to an attacker origin. A 3xx is
+    // surfaced to the agent as a normal status instead.
     let client = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(30))
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .context("Failed to build HTTP client")?;
 
@@ -194,14 +270,34 @@ pub fn call_service(
         }
     }
 
-    let response = request
-        .send()
-        .with_context(|| format!("Request to service '{}' failed", service_name))?;
+    // CRITICAL: a reqwest error's Display includes the full request URL — for the
+    // Query auth scheme that URL carries `?<name>=<secret>`. Strip the URL with
+    // `without_url()` AND redact the secret value as defense-in-depth so the
+    // credential can never reach the error string returned to the agent or logs.
+    let response = match request.send() {
+        Ok(r) => r,
+        Err(e) => {
+            let sanitized = sanitize_request_error(e, &secret);
+            return Err(anyhow!(
+                "Request to service '{}' failed: {}",
+                service_name,
+                sanitized
+            ));
+        }
+    };
 
     let status = response.status().as_u16();
-    let raw_body = response
-        .text()
-        .context("Failed to read response body from service")?;
+    let raw_body = match response.text() {
+        Ok(b) => b,
+        Err(e) => {
+            let sanitized = sanitize_request_error(e, &secret);
+            return Err(anyhow!(
+                "Failed to read response body from service '{}': {}",
+                service_name,
+                sanitized
+            ));
+        }
+    };
 
     // Redact the injected secret out of the body before it can reach the agent.
     let body = redact_secret(&raw_body, &secret);
@@ -212,8 +308,81 @@ pub fn call_service(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{AuthScheme, Config};
+    use crate::config::{AuthScheme, Config, ServiceInfo};
     use std::collections::HashMap;
+
+    /// Build a ServiceInfo with optional method/path allowlists for guardrail tests.
+    fn service_with_guards(
+        allowed_methods: Option<Vec<&str>>,
+        allowed_path_prefixes: Option<Vec<&str>>,
+    ) -> ServiceInfo {
+        ServiceInfo {
+            base_url: "https://api.example.com/v1".to_string(),
+            auth: AuthScheme::Bearer,
+            secret_name: "Token".to_string(),
+            extra: None,
+            allowed_methods: allowed_methods
+                .map(|v| v.into_iter().map(|s| s.to_string()).collect()),
+            allowed_path_prefixes: allowed_path_prefixes
+                .map(|v| v.into_iter().map(|s| s.to_string()).collect()),
+        }
+    }
+
+    #[test]
+    fn validate_method_allowed_enforces_allowlist_fail_closed() {
+        // No allowlist → any globally-permitted verb is fine.
+        let open = service_with_guards(None, None);
+        assert!(validate_method_allowed(&open, "DELETE").is_ok());
+
+        // Read-only service: only GET permitted (case-insensitive).
+        let ro = service_with_guards(Some(vec!["GET"]), None);
+        assert!(validate_method_allowed(&ro, "get").is_ok());
+        assert!(validate_method_allowed(&ro, "POST").is_err());
+        assert!(validate_method_allowed(&ro, "DELETE").is_err());
+    }
+
+    #[test]
+    fn validate_path_allowed_rejects_traversal_and_enforces_prefix() {
+        // `..` is rejected even with no prefix allowlist configured.
+        let open = service_with_guards(None, None);
+        assert!(validate_path_allowed(&open, "/zones/123").is_ok());
+        assert!(validate_path_allowed(&open, "/zones/../../etc").is_err());
+
+        // Prefix allowlist confines the agent (slash normalization on both sides).
+        let confined = service_with_guards(None, Some(vec!["/zones"]));
+        assert!(validate_path_allowed(&confined, "/zones/123/dns_records").is_ok());
+        assert!(validate_path_allowed(&confined, "zones/123").is_ok());
+        assert!(validate_path_allowed(&confined, "/user/tokens").is_err());
+    }
+
+    #[test]
+    fn call_service_rejects_disallowed_method_before_vault_access() {
+        // A read-only service must refuse a DELETE without touching the keychain
+        // or the network (validation happens before secret load).
+        let mut services = HashMap::new();
+        services.insert("ro".to_string(), service_with_guards(Some(vec!["GET"]), None));
+        let config = Config {
+            servers: HashMap::new(),
+            services,
+        };
+        let err = call_service("ro", "DELETE", "/zones", None, None, &config).unwrap_err();
+        assert!(err.to_string().contains("not permitted"));
+    }
+
+    #[test]
+    fn call_service_rejects_disallowed_path_before_vault_access() {
+        let mut services = HashMap::new();
+        services.insert(
+            "confined".to_string(),
+            service_with_guards(None, Some(vec!["/zones"])),
+        );
+        let config = Config {
+            servers: HashMap::new(),
+            services,
+        };
+        let err = call_service("confined", "GET", "/user/tokens", None, None, &config).unwrap_err();
+        assert!(err.to_string().contains("not within an allowed path prefix"));
+    }
 
     #[test]
     fn build_url_normalizes_slashes() {

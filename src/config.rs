@@ -60,6 +60,19 @@ pub struct ServiceInfo {
     /// Optional static headers applied to every request to this service.
     #[serde(default)]
     pub extra: Option<HashMap<String, String>>,
+    /// Optional allowlist of permitted HTTP methods (case-insensitive). When
+    /// present and non-empty, `call_service_api` only issues requests whose
+    /// method is in this list (fail-closed); when absent/empty, any method in
+    /// the global verb set (GET/POST/PUT/PATCH/DELETE) is permitted. Use it to
+    /// pin a service to read-only access (`["GET"]`).
+    #[serde(default)]
+    pub allowed_methods: Option<Vec<String>>,
+    /// Optional allowlist of permitted request path prefixes. When present and
+    /// non-empty, the caller-supplied `path` must start with one of these
+    /// prefixes (fail-closed); when absent/empty, any path under `base_url` is
+    /// permitted. Confines the agent to a subset of the service's API surface.
+    #[serde(default)]
+    pub allowed_path_prefixes: Option<Vec<String>>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]

@@ -510,7 +510,15 @@ fn handle_request(
                                 error_result(scrubbed)
                             }
                         }
-                        Err(e) => error_result(format!("Error calling service: {}", e)),
+                        Err(e) => {
+                            // The http layer already strips the request URL and
+                            // redacts the injected secret from error text; run the
+                            // message through the pattern scrubber as well so no
+                            // data-bearing output reaches the agent unscrubbed.
+                            let scrubbed =
+                                scrubber::scrub_output(&format!("Error calling service: {}", e), &[]);
+                            error_result(scrubbed)
+                        }
                     }
                 }
                 "run_command" => {
