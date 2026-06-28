@@ -33,5 +33,17 @@
         "uptime"
       ]
     }
+  },
+  "services": {
+    "cloudflare": {
+      "base_url": "https://api.cloudflare.com/client/v4",
+      "auth": "bearer",
+      "secret_name": "CloudflareToken"
+    },
+    "resend": {
+      "base_url": "https://api.resend.com",
+      "auth": { "header": { "name": "Authorization" } },
+      "secret_name": "ResendKey"
+    }
   }
 }

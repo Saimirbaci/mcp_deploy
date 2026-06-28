@@ -2,6 +2,7 @@ mod audit;
 mod command_guard;
 mod config;
 mod diff;
+mod http;
 mod mcp;
 mod scrubber;
 mod sql_guard;

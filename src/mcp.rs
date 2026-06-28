@@ -1,6 +1,7 @@
 use crate::audit::AuditLog;
 use crate::config::{self, Config, Secrets};
 use crate::diff;
+use crate::http;
 use crate::scrubber;
 use crate::ssh;
 use anyhow::Result;
@@ -193,6 +194,18 @@ fn describe_tool_call(tool_name: &str, arguments: &Value) -> (String, String, Ve
         "list_db_tables" => ("list_db_tables".to_string(), vec![]),
         "list_local_secret_names" => ("list_local_secret_names".to_string(), vec![]),
         "list_allowed_servers" => ("list_allowed_servers".to_string(), vec![]),
+        "list_allowed_services" => ("list_allowed_services".to_string(), vec![]),
+        "call_service_api" => (
+            // Value-free: method, service name, and path only. The credential
+            // name lives in service config, not in the call arguments.
+            format!(
+                "call_service_api: {} {} {}",
+                arguments["method"].as_str().unwrap_or(""),
+                arguments["service"].as_str().unwrap_or(""),
+                arguments["path"].as_str().unwrap_or("")
+            ),
+            vec![],
+        ),
         "deploy_secret_to_server" => {
             let env_key = arguments["env_key"].as_str().unwrap_or("");
             let secret_name = arguments["local_secret_name"]
@@ -260,6 +273,44 @@ fn handle_request(
                         "inputSchema": {
                             "type": "object",
                             "properties": {}
+                        }
+                    },
+                    {
+                        "name": "list_allowed_services",
+                        "description": "Returns the list of allow-listed HTTP services (name and base_url) that can be driven via call_service_api. Secret names and values are never returned.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {}
+                        }
+                    },
+                    {
+                        "name": "call_service_api",
+                        "description": "Performs an authenticated HTTP request against an allow-listed service (see list_allowed_services). BLIND-CREDENTIAL MODEL: you only name the service; the MCP server injects the configured credential from the local vault and the secret value is NEVER returned to you or written to logs. On a non-2xx response the body is still returned (with isError set) so you can debug.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "service": {
+                                    "type": "string",
+                                    "description": "The name of the allow-listed service (e.g. 'cloudflare')."
+                                },
+                                "method": {
+                                    "type": "string",
+                                    "enum": ["GET", "POST", "PUT", "PATCH", "DELETE"],
+                                    "description": "The HTTP method to use."
+                                },
+                                "path": {
+                                    "type": "string",
+                                    "description": "The request path appended to the service base_url (e.g. '/user/tokens/verify')."
+                                },
+                                "query": {
+                                    "type": "object",
+                                    "description": "Optional query-string parameters as a flat object of string/number/bool values."
+                                },
+                                "body": {
+                                    "description": "Optional request body for write methods, as a JSON object or a raw string."
+                                }
+                            },
+                            "required": ["service", "method", "path"]
                         }
                     },
                     {
@@ -423,6 +474,44 @@ fn handle_request(
                         })),
                         None,
                     )
+                }
+                "list_allowed_services" => {
+                    let services = config.allowed_services();
+                    (
+                        Some(json!({
+                            "content": [
+                                {
+                                    "type": "text",
+                                    "text": format!("Allowed Services: {:?}", services)
+                                }
+                            ]
+                        })),
+                        None,
+                    )
+                }
+                "call_service_api" => {
+                    let service = arguments["service"].as_str().unwrap_or("");
+                    let method = arguments["method"].as_str().unwrap_or("");
+                    let path = arguments["path"].as_str().unwrap_or("");
+                    let query = arguments.get("query").filter(|v| !v.is_null());
+                    let body = arguments.get("body").filter(|v| !v.is_null());
+
+                    match http::call_service(service, method, path, query, body, config) {
+                        Ok(resp) => {
+                            // Defense-in-depth: the http layer already redacts the
+                            // injected secret; run the body through the pattern
+                            // scrubber as well before returning it to the agent.
+                            let scrubbed = scrubber::scrub_output(&resp.render(), &[]);
+                            if resp.is_success() {
+                                text_result(scrubbed)
+                            } else {
+                                // Non-2xx: still return the body so the agent can
+                                // debug, but flag it as an error.
+                                error_result(scrubbed)
+                            }
+                        }
+                        Err(e) => error_result(format!("Error calling service: {}", e)),
+                    }
                 }
                 "run_command" => {
                     let target = arguments["target"].as_str().unwrap_or("");

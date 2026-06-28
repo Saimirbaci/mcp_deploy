@@ -27,9 +27,48 @@ pub struct ServerInfo {
     pub allowed_command_prefixes: Option<Vec<String>>,
 }
 
+/// How a service's credential is injected into outgoing HTTP requests.
+///
+/// Uses serde's default (externally tagged) representation so the unit variant
+/// deserializes from a bare string (`"auth": "bearer"`) while the parameterized
+/// variants deserialize from an object (`{"header": {"name": "X-Api-Key"}}` /
+/// `{"query": {"name": "api_key"}}`).
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "snake_case")]
+pub enum AuthScheme {
+    /// Send the secret as an `Authorization: Bearer <secret>` header.
+    Bearer,
+    /// Send the secret as the value of a named request header.
+    Header { name: String },
+    /// Send the secret as the value of a named query-string parameter.
+    Query { name: String },
+}
+
+/// An allow-listed outbound HTTP API the agent can drive via `call_service_api`.
+///
+/// The agent only ever names the service; the credential lives in the local
+/// vault under `secret_name` and is injected by the MCP server. The secret value
+/// is never returned to the agent.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct ServiceInfo {
+    /// Base URL the service's request paths are joined onto.
+    pub base_url: String,
+    /// How the credential is applied to each request.
+    pub auth: AuthScheme,
+    /// Name of the secret (in the local vault) holding the credential value.
+    pub secret_name: String,
+    /// Optional static headers applied to every request to this service.
+    #[serde(default)]
+    pub extra: Option<HashMap<String, String>>,
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Config {
     pub servers: HashMap<String, ServerInfo>,
+    /// Optional map of allow-listed HTTP services. Absent in `servers`-only
+    /// configs (back-compat), in which case it defaults to an empty map.
+    #[serde(default)]
+    pub services: HashMap<String, ServiceInfo>,
 }
 
 /// Service name used to namespace this application's entries in the OS keychain.
@@ -211,6 +250,20 @@ impl Config {
             .map(|(ip, info)| (ip.clone(), info.alias.clone()))
             .collect()
     }
+
+    /// Look up an allow-listed service by name.
+    pub fn get_service(&self, name: &str) -> Option<&ServiceInfo> {
+        self.services.get(name)
+    }
+
+    /// List the allow-listed services as `(name, base_url)` pairs. The secret
+    /// name and value are intentionally never exposed here.
+    pub fn allowed_services(&self) -> Vec<(String, String)> {
+        self.services
+            .iter()
+            .map(|(name, info)| (name.clone(), info.base_url.clone()))
+            .collect()
+    }
 }
 
 #[cfg(test)]
@@ -230,6 +283,76 @@ mod tests {
         let parsed: HashMap<String, String> = serde_json::from_str(&blob).unwrap();
 
         assert_eq!(data, parsed);
+    }
+
+    #[test]
+    fn test_servers_only_config_loads_without_services() {
+        // Back-compat: a config with no `services` block must still load, with
+        // `services` defaulting to an empty map.
+        let json = r#"{
+            "servers": {
+                "10.0.0.1": {
+                    "alias": "web",
+                    "user": "deploy",
+                    "key_path": "/home/deploy/.ssh/id_rsa",
+                    "db_config": null,
+                    "default_env_path": null,
+                    "secrets_path": null
+                }
+            }
+        }"#;
+        let config: Config = serde_json::from_str(json).unwrap();
+        assert_eq!(config.servers.len(), 1);
+        assert!(config.services.is_empty());
+        assert!(config.allowed_services().is_empty());
+    }
+
+    #[test]
+    fn test_services_block_parses_each_auth_scheme() {
+        let json = r#"{
+            "servers": {},
+            "services": {
+                "cloudflare": {
+                    "base_url": "https://api.cloudflare.com/client/v4",
+                    "auth": "bearer",
+                    "secret_name": "CloudflareToken"
+                },
+                "resend": {
+                    "base_url": "https://api.resend.com",
+                    "auth": { "header": { "name": "X-Api-Key" } },
+                    "secret_name": "ResendKey"
+                },
+                "legacy": {
+                    "base_url": "https://api.legacy.test",
+                    "auth": { "query": { "name": "api_key" } },
+                    "secret_name": "LegacyKey"
+                }
+            }
+        }"#;
+        let config: Config = serde_json::from_str(json).unwrap();
+
+        let cf = config.get_service("cloudflare").unwrap();
+        assert!(matches!(cf.auth, AuthScheme::Bearer));
+        assert_eq!(cf.secret_name, "CloudflareToken");
+
+        let resend = config.get_service("resend").unwrap();
+        match &resend.auth {
+            AuthScheme::Header { name } => assert_eq!(name, "X-Api-Key"),
+            other => panic!("expected Header scheme, got {:?}", other),
+        }
+
+        let legacy = config.get_service("legacy").unwrap();
+        match &legacy.auth {
+            AuthScheme::Query { name } => assert_eq!(name, "api_key"),
+            other => panic!("expected Query scheme, got {:?}", other),
+        }
+
+        // allowed_services exposes name + base_url only, never the secret name.
+        let mut allowed = config.allowed_services();
+        allowed.sort();
+        assert_eq!(allowed[0].0, "cloudflare");
+        assert_eq!(allowed[0].1, "https://api.cloudflare.com/client/v4");
+        assert!(!format!("{:?}", allowed).contains("CloudflareToken"));
     }
 
     #[test]
