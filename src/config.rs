@@ -114,6 +114,17 @@ pub struct Config {
 /// Service name used to namespace this application's entries in the OS keychain.
 const KEYCHAIN_SERVICE: &str = "mcp_deploy_vault";
 
+/// Actionable suffix appended to keychain failures. The `Keychain` backend is
+/// the default, but on non-macOS/headless/CI hosts the OS keyring (macOS
+/// Keychain, Linux Secret Service / dbus, etc.) may be unavailable, in which
+/// case keychain access fails hard. Rather than surface an opaque keyring error,
+/// point the operator at the plaintext opt-out so a config that omitted
+/// `secret_backend` and inherited the secure default can recover.
+const KEYCHAIN_UNAVAILABLE_HINT: &str = "The OS keychain may be unavailable on \
+    this host (e.g. non-macOS, headless, SSH, or CI). If so, set \
+    \"secret_backend\": \"json\" in the config to use the plaintext vault \
+    instead (0600 file permissions, not encrypted at rest).";
+
 /// A secret vault with a selectable persistence backend.
 ///
 /// The in-memory shape is identical regardless of backend: a `name -> value`
@@ -145,8 +156,13 @@ impl SecretStore {
     /// The account is kept out of any error message so that a configured
     /// secrets path is never leaked through error reporting.
     fn entry(account: &str) -> Result<keyring::Entry> {
-        keyring::Entry::new(KEYCHAIN_SERVICE, account)
-            .context("Failed to open OS keychain entry for the secret vault")
+        keyring::Entry::new(KEYCHAIN_SERVICE, account).map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to open OS keychain entry for the secret vault: {}. {}",
+                e,
+                KEYCHAIN_UNAVAILABLE_HINT
+            )
+        })
     }
 
     /// Load the vault for the given secrets path using `backend`.
@@ -202,8 +218,9 @@ impl SecretStore {
             }
             Err(keyring::Error::NoEntry) => Self::migrate_or_empty(account),
             Err(e) => Err(anyhow::anyhow!(
-                "Failed to read secrets from the OS keychain: {}",
-                e
+                "Failed to read secrets from the OS keychain: {}. {}",
+                e,
+                KEYCHAIN_UNAVAILABLE_HINT
             )),
         }
     }
@@ -220,6 +237,10 @@ impl SecretStore {
             });
         }
 
+        // A legacy plaintext vault about to be migrated may have been created
+        // manually or restored loosely-permissioned; alert the operator if its
+        // secrets were exposed beyond the owner before we move it aside.
+        warn_if_world_readable(&account);
         let content = fs::read_to_string(&path)?;
         let data: HashMap<String, String> = serde_json::from_str(&content)
             .context("Failed to parse legacy plaintext secrets JSON")?;
@@ -265,9 +286,13 @@ impl SecretStore {
         let blob = serde_json::to_string(&self.data)
             .context("Failed to serialize secrets for the OS keychain")?;
         let entry = Self::entry(&self.locator)?;
-        entry
-            .set_password(&blob)
-            .context("Failed to write secrets to the OS keychain")?;
+        entry.set_password(&blob).map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to write secrets to the OS keychain: {}. {}",
+                e,
+                KEYCHAIN_UNAVAILABLE_HINT
+            )
+        })?;
         Ok(())
     }
 
@@ -283,17 +308,40 @@ impl SecretStore {
             && !parent.as_os_str().is_empty()
             && !parent.exists()
         {
+            // Collect the missing ancestors BEFORE creating them so each level
+            // create_dir_all materializes can be restricted to the owner — not
+            // just the leaf. create_dir_all honors the umask (typically 0755),
+            // which would leave intermediate levels world-traversable.
+            #[cfg(unix)]
+            let created: Vec<std::path::PathBuf> = {
+                let mut missing = Vec::new();
+                let mut cur = Some(parent);
+                while let Some(dir) = cur {
+                    if dir.as_os_str().is_empty() || dir.exists() {
+                        break;
+                    }
+                    missing.push(dir.to_path_buf());
+                    cur = dir.parent();
+                }
+                missing
+            };
+
             fs::create_dir_all(parent).context("Failed to create secrets directory")?;
-            // Restrict a directory we just created to the owner so its existence
-            // and listing are not world-traversable (create_dir_all honors the
-            // umask, which is typically 0755). Only applied to directories we
-            // create — we never forcibly re-chmod a pre-existing directory, and
-            // a failure here must not block persisting the vault.
+
+            // Restrict every directory we just created to the owner so its
+            // existence and listing are not world-traversable. Only applied to
+            // directories we created — we never forcibly re-chmod a pre-existing
+            // directory, and a failure here must not block persisting the vault.
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
-                if let Err(e) = fs::set_permissions(parent, fs::Permissions::from_mode(0o700)) {
-                    tracing::warn!("Failed to restrict secrets directory permissions: {}", e);
+                for dir in &created {
+                    if let Err(e) = fs::set_permissions(dir, fs::Permissions::from_mode(0o700)) {
+                        tracing::warn!(
+                            "Failed to restrict secrets directory permissions: {}",
+                            e
+                        );
+                    }
                 }
             }
         }
@@ -405,7 +453,8 @@ impl Config {
         Ok(config)
     }
 
-    /// The resolved secret-vault backend (defaults to `JsonFile`).
+    /// The resolved secret-vault backend (defaults to `Keychain`; plaintext
+    /// `JsonFile` is an explicit `"secret_backend": "json"` opt-out).
     pub fn secret_backend(&self) -> SecretBackend {
         self.secret_backend
     }
@@ -636,6 +685,37 @@ mod tests {
         assert!(on_disk.contains("plaintext-secret"));
 
         let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_jsonfile_backend_restricts_all_created_dir_levels_to_0700() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // Build a vault path several missing levels deep so save() must create
+        // more than one directory; every level it creates must be owner-only
+        // (0700), not just the leaf.
+        let mut base = std::env::temp_dir();
+        base.push(format!("mcp_deploy_dirperms_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let nested = base.join("level1").join("level2");
+        let path = nested.join("mcp_secrets.json");
+
+        let mut store = SecretStore::load(SecretBackend::JsonFile, &path).unwrap();
+        store.set("Token", "plaintext-secret").unwrap();
+
+        for dir in [&base, &base.join("level1"), &nested] {
+            let mode = fs::metadata(dir).unwrap().permissions().mode() & 0o777;
+            assert_eq!(
+                mode,
+                0o700,
+                "created dir {:?} must be 0700, got {:o}",
+                dir,
+                mode
+            );
+        }
+
+        let _ = fs::remove_dir_all(&base);
     }
 
     #[test]

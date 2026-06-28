@@ -117,6 +117,17 @@ fn run_secret_action(config_path: &str, action: SecretAction) -> Result<()> {
     let config =
         Config::load(config_path).context(format!("Failed to load config from {}", config_path))?;
 
+    // Mirror the MCP server's startup warning for CLI vault management: an
+    // operator managing secrets via the `secret` subcommand should get the same
+    // at-rest-exposure notice when the plaintext backend is active.
+    if config.secret_backend() == config::SecretBackend::JsonFile {
+        tracing::warn!(
+            "Secret vault backend is 'json': secrets are stored UNENCRYPTED on \
+             disk (0600 file permissions only). Set \"secret_backend\": \
+             \"keychain\" in the config to encrypt them at rest."
+        );
+    }
+
     match action {
         SecretAction::Add { name, server } => {
             let path = resolve_secrets_path(&config, &server)?;

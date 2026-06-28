@@ -206,6 +206,20 @@ JSON storage (back-compat / non-macOS); the MCP server logs a warning at startup
 whenever the plaintext backend is active so the weaker at-rest posture is never
 silent.
 
+> ⚠️ **Upgrade / breaking-change note (default flipped to `keychain`).** Earlier
+> builds that supported a plaintext JSON vault treated the **omitted** field as
+> plaintext JSON; it now defaults to `keychain`. Two consequences for existing
+> configs that omit `secret_backend`:
+> - **First load auto-migrates** any existing plaintext `mcp_secrets.json` into
+>   the OS keychain and renames the original to `*.json.migrated` (a full
+>   plaintext copy left on disk — **delete it once verified**). To keep the old
+>   behavior and skip migration entirely, set `"secret_backend": "json"`.
+> - **On non-macOS / headless / SSH / CI hosts** the OS keyring may be
+>   unavailable, in which case keychain load/save fails hard where the old
+>   plaintext default would have succeeded. The error explicitly points you at
+>   `"secret_backend": "json"`; set it to restore plaintext-vault behavior on
+>   hosts without a usable keyring.
+
 Manage the vault with the `secret` subcommand (`set`/`rm` are accepted as aliases
 for `add`/`remove`). The value is **never** taken from a command-line argument:
 in an interactive terminal it is read with a **no-echo prompt** (the typed value
