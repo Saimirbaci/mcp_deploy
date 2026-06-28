@@ -110,6 +110,72 @@ Or specify a custom config path:
      `confirm_token`) returns a diff showing whether the key is added or updated
      — the secret value is always **redacted** — plus a `confirm_token` that must
      be passed back to apply the change.
+7. **`list_allowed_services`**: Returns the allow-listed HTTP services (name and
+   `base_url`) that can be driven via `call_service_api`. The secret name and
+   value are **never** returned.
+8. **`call_service_api`**: Performs an authenticated HTTP request against an
+   allow-listed service (see the `services` config block below).
+   - **Arguments**: `service` (string), `method` (`GET`/`POST`/`PUT`/`PATCH`/`DELETE`),
+     `path` (string), `query` (object, optional), `body` (object or string, optional)
+   - **Blind credential model**: The agent only names the service. The MCP server
+     looks up the configured secret in the local vault and injects it into the
+     request per the service's `auth` scheme (`bearer`, `header`, or `query`). The
+     secret value is **never** returned to the agent nor written to logs (it is
+     redacted out of the response body before it is returned).
+   - **Errors**: A non-2xx response still returns the response body (with
+     `isError` set) so the agent can debug. A request to a service that is not in
+     the `services` allow-list — or that violates a per-service method/path
+     guardrail — is refused with a clear error (boundary-control parity with
+     SSH). Error text is stripped of the request URL and the injected secret, so
+     a credential can never leak through an error message or log line.
+   - **No redirects**: The HTTP client does **not** follow redirects; a 3xx is
+     returned to the agent as a normal status. This prevents an open redirect on
+     an allow-listed host from forwarding the injected credential (header or
+     query) to an attacker-controlled origin.
+
+### HTTP Services (`call_service_api`)
+In addition to SSH targets, the config may define an optional `services` map of
+allow-listed HTTP APIs. Each service references a credential **by name** only —
+the value lives in the local vault and is injected server-side:
+
+```json
+"services": {
+  "cloudflare": {
+    "base_url": "https://api.cloudflare.com/client/v4",
+    "auth": "bearer",
+    "secret_name": "CloudflareToken",
+    "allowed_methods": ["GET", "POST", "PUT", "PATCH", "DELETE"],
+    "allowed_path_prefixes": ["/zones", "/user/tokens/verify"]
+  },
+  "resend": {
+    "base_url": "https://api.resend.com",
+    "auth": { "header": { "name": "Authorization" } },
+    "secret_name": "ResendKey",
+    "allowed_methods": ["GET"]
+  }
+}
+```
+
+- `auth` accepts `"bearer"` (sends `Authorization: Bearer <secret>`),
+  `{ "header": { "name": "X-Api-Key" } }` (sends the secret as a named header),
+  or `{ "query": { "name": "api_key" } }` (sends the secret as a query param).
+  **Prefer header- or bearer-based schemes**: the `query` scheme puts the secret
+  in the URL, which upstream servers, proxies, and load balancers commonly log —
+  the local response/error output is redacted, but the credential is still
+  exposed to the upstream's own logs.
+- `secret_name` names a secret stored in the local vault (add it with
+  `printf '<token>' | mcp_deploy secret add CloudflareToken`). Only the name
+  appears in config; the value is never exposed to the agent.
+- `allowed_methods` (optional) is a fail-closed allowlist of HTTP verbs for the
+  service, the HTTP analogue of `allowed_command_prefixes`. Pin a service to
+  read-only access with `["GET"]`. Omit it to permit any global verb.
+- `allowed_path_prefixes` (optional) is a fail-closed allowlist confining the
+  agent to a subset of the service's API surface; the request `path` must start
+  with one of the prefixes. Regardless of this setting, paths containing `..`
+  traversal segments are always rejected.
+- An optional `extra` object adds static (non-secret) headers to every request.
+- The `services` block is optional and additive — existing `servers`-only
+  configs continue to load unchanged.
 
 ### The Secret Vault (Encrypted at Rest in the macOS Keychain)
 Secrets are stored in the **macOS Keychain**, so they are encrypted at rest and
