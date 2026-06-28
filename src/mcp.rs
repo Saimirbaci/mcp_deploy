@@ -65,6 +65,17 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock};
 
 pub fn run_server(initial_config: Config, config_path: String, audit_path: String) -> Result<()> {
+    // Surface a clear warning when the vault is configured for plaintext storage
+    // so operators don't unknowingly run with secrets unencrypted at rest. The
+    // secure default (Keychain) stays silent.
+    if initial_config.secret_backend() == config::SecretBackend::JsonFile {
+        error!(
+            "Secret vault backend is 'json': secrets are stored UNENCRYPTED on \
+             disk (0600 file permissions only). Set \"secret_backend\": \
+             \"keychain\" in the config to encrypt them at rest."
+        );
+    }
+
     let config = Arc::new(RwLock::new(initial_config));
     let pending: PendingStore = Arc::new(Mutex::new(HashSet::new()));
     let audit = Arc::new(AuditLog::open(&audit_path)?);

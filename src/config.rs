@@ -78,18 +78,23 @@ pub struct ServiceInfo {
 /// Which persistence backend the secret vault uses.
 ///
 /// Selected by the top-level `secret_backend` config field. Defaults to
-/// `JsonFile` for back-compat: existing plaintext-JSON vaults keep working
-/// unchanged. `Keychain` opts into OS-encrypted-at-rest storage (macOS
-/// Keychain) and auto-migrates a legacy plaintext file on first load.
+/// `Keychain` (encrypted at rest) so that the secure-by-default posture of the
+/// keychain-only baseline is preserved: configs that omit the field — including
+/// those of users who already migrated their vault into the OS keychain — keep
+/// reading the encrypted vault, and a legacy plaintext file is auto-migrated on
+/// first load. `JsonFile` is an explicit opt-out (`"secret_backend": "json"`)
+/// that stores the vault as a plaintext JSON map, protected only by `0600` file
+/// permissions.
 #[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum SecretBackend {
-    /// Plaintext JSON map at `secrets_path` (default; protected by file perms).
-    #[serde(rename = "json")]
+    /// OS keychain entry, encrypted at rest (default). Account derived from
+    /// `secrets_path`; auto-migrates a legacy plaintext file on first load.
     #[default]
-    JsonFile,
-    /// OS keychain entry, encrypted at rest. Account derived from `secrets_path`.
     Keychain,
+    /// Plaintext JSON map at `secrets_path` (explicit opt-out; 0600 file perms).
+    #[serde(rename = "json")]
+    JsonFile,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -100,7 +105,8 @@ pub struct Config {
     #[serde(default)]
     pub services: HashMap<String, ServiceInfo>,
     /// Which backend the secret vault uses. Absent in older configs, in which
-    /// case it defaults to `JsonFile` so existing plaintext vaults keep working.
+    /// case it defaults to `Keychain` so already-migrated vaults keep working
+    /// and secrets stay encrypted at rest by default.
     #[serde(default)]
     pub secret_backend: SecretBackend,
 }
@@ -165,8 +171,16 @@ impl SecretStore {
     fn read_json_file(path: &str) -> Result<HashMap<String, String>> {
         match fs::read_to_string(path) {
             Ok(content) if content.trim().is_empty() => Ok(HashMap::new()),
-            Ok(content) => serde_json::from_str(&content)
-                .context("Failed to parse plaintext secrets JSON file"),
+            Ok(content) => {
+                // The tool always writes 0600, but a file created manually,
+                // restored from backup, or left as a `.json.migrated` artifact
+                // could be group/world-readable. Warn rather than fail so a
+                // legitimate-but-loose vault still loads, but the operator is
+                // alerted that plaintext secrets are exposed.
+                warn_if_world_readable(path);
+                serde_json::from_str(&content)
+                    .context("Failed to parse plaintext secrets JSON file")
+            }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(HashMap::new()),
             Err(e) => Err(anyhow::anyhow!("Failed to read secrets file: {}", e)),
         }
@@ -267,8 +281,21 @@ impl SecretStore {
         let path = Path::new(&self.locator);
         if let Some(parent) = path.parent()
             && !parent.as_os_str().is_empty()
+            && !parent.exists()
         {
             fs::create_dir_all(parent).context("Failed to create secrets directory")?;
+            // Restrict a directory we just created to the owner so its existence
+            // and listing are not world-traversable (create_dir_all honors the
+            // umask, which is typically 0755). Only applied to directories we
+            // create — we never forcibly re-chmod a pre-existing directory, and
+            // a failure here must not block persisting the vault.
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                if let Err(e) = fs::set_permissions(parent, fs::Permissions::from_mode(0o700)) {
+                    tracing::warn!("Failed to restrict secrets directory permissions: {}", e);
+                }
+            }
         }
 
         let tmp = path.with_extension("json.tmp");
@@ -329,6 +356,28 @@ impl SecretStore {
         self.data.values().cloned().collect()
     }
 }
+
+/// Warn (without failing) when a plaintext secrets file is readable by group or
+/// others. No-op on non-unix platforms where these mode bits don't apply. The
+/// path is not embedded in the message so a configured secrets path is not
+/// leaked into logs.
+#[cfg(unix)]
+fn warn_if_world_readable(path: &str) {
+    use std::os::unix::fs::PermissionsExt;
+    if let Ok(meta) = fs::metadata(path) {
+        let mode = meta.permissions().mode() & 0o077;
+        if mode != 0 {
+            tracing::warn!(
+                "Plaintext secrets file is accessible beyond its owner \
+                 (mode {:o}); tighten it to 0600 to avoid exposing secrets.",
+                meta.permissions().mode() & 0o777
+            );
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn warn_if_world_readable(_path: &str) {}
 
 /// Loads the literal vault secret values associated with a target server so they
 /// can be scrubbed out of tool output. Failures (missing/unreadable vault) yield
@@ -441,13 +490,13 @@ mod tests {
     }
 
     #[test]
-    fn test_secret_backend_defaults_to_json_when_absent() {
-        // Back-compat: a config without `secret_backend` must still load and
-        // resolve to the JsonFile backend so existing plaintext vaults keep
-        // working unchanged.
+    fn test_secret_backend_defaults_to_keychain_when_absent() {
+        // Secure default: a config without `secret_backend` must resolve to the
+        // Keychain backend so already-migrated vaults keep working and secrets
+        // stay encrypted at rest. Plaintext JSON is an explicit opt-out.
         let json = r#"{ "servers": {} }"#;
         let config: Config = serde_json::from_str(json).unwrap();
-        assert_eq!(config.secret_backend(), SecretBackend::JsonFile);
+        assert_eq!(config.secret_backend(), SecretBackend::Keychain);
     }
 
     #[test]

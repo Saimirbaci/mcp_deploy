@@ -1,5 +1,5 @@
 {
-  "secret_backend": "json",
+  "secret_backend": "keychain",
   "servers": {
     "[IP_ADDRESS]": {
       "alias": "local_vm",

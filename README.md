@@ -177,7 +177,7 @@ the value lives in the local vault and is injected server-side:
 - The `services` block is optional and additive — existing `servers`-only
   configs continue to load unchanged.
 
-### The Secret Vault (Selectable Backend)
+### The Secret Vault (Encrypted at Rest by Default, Selectable Backend)
 The local secret vault holds the API keys and tokens that the MCP server injects
 into SSH `.env` deploys and outbound `call_service_api` requests. The agent only
 ever sees secret **names** — values are read internally for injection and never
@@ -185,10 +185,10 @@ returned to the chat or logs.
 
 The storage backend is chosen by the top-level **`secret_backend`** config field:
 
-| `secret_backend` | Where secrets live | Encrypted at rest? |
-|------------------|--------------------|--------------------|
-| `json` (default) | A plaintext JSON map at `secrets_path` (default `~/.remote_connections/mcp_secrets.json`), written atomically with `0600` permissions | No — protected only by file permissions |
-| `keychain`       | The **macOS Keychain** under the service namespace `mcp_deploy_vault`, namespaced per vault by `secrets_path` | Yes — gated and encrypted by the OS |
+| `secret_backend`      | Where secrets live | Encrypted at rest? |
+|-----------------------|--------------------|--------------------|
+| `keychain` (default)  | The **macOS Keychain** under the service namespace `mcp_deploy_vault`, namespaced per vault by `secrets_path` | Yes — gated and encrypted by the OS |
+| `json`                | A plaintext JSON map at `secrets_path` (default `~/.remote_connections/mcp_secrets.json`), written atomically with `0600` permissions | No — protected only by file permissions |
 
 ```json
 {
@@ -197,10 +197,14 @@ The storage backend is chosen by the top-level **`secret_backend`** config field
 }
 ```
 
-Omit `secret_backend` (or set `"json"`) to keep the original plaintext-JSON
-behavior, so **existing configs and vault files keep working unchanged**. Set
-`"keychain"` to store new (and migrated) secrets encrypted at rest — recommended
-for higher-value cloud credentials (Cloudflare, Resend, OpenRouter, GCP, …).
+`secret_backend` defaults to **`keychain`**, so secrets are encrypted at rest by
+default and a config that omits the field keeps reading the encrypted vault — this
+preserves the behavior of the keychain-only build for anyone who already migrated.
+A legacy plaintext file is auto-migrated into the keychain on first load (see
+below). Set `"secret_backend": "json"` to **explicitly opt out** into plaintext
+JSON storage (back-compat / non-macOS); the MCP server logs a warning at startup
+whenever the plaintext backend is active so the weaker at-rest posture is never
+silent.
 
 Manage the vault with the `secret` subcommand (`set`/`rm` are accepted as aliases
 for `add`/`remove`). The value is **never** taken from a command-line argument:
@@ -227,11 +231,13 @@ Use `--server <alias_or_ip>` to target a server-specific vault when a
 is used. The same `secrets_path` is honored by both backends (as the file path
 for `json`, and as the keychain account namespace for `keychain`).
 
-**Migration to the keychain**: when `secret_backend` is `keychain` and a legacy
-plaintext file exists at the vault path, its contents are imported into the
-Keychain automatically on first access and the plaintext file is renamed to
-`*.json.migrated` (delete it once verified). Plain `json`-backend users are never
-touched by this migration.
+**Migration to the keychain**: with the default `keychain` backend, if no
+keychain entry exists yet but a legacy plaintext file is present at the vault
+path, its contents are imported into the Keychain automatically on first access
+and the plaintext file is renamed to `*.json.migrated`. **Delete that backup once
+verified** — it is a full plaintext copy of every secret and is left in place
+only to avoid destroying data outright. Users who explicitly opt into the `json`
+backend are never touched by this migration.
 
 > The Foundation `call_service_api` tool reads its credentials through this same
 > vault (by the service's configured `secret_name`), so switching `secret_backend`
