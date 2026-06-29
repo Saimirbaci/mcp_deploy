@@ -608,6 +608,39 @@ mod tests {
     }
 
     #[test]
+    fn test_cloudflare_entry_parses_with_method_and_path_allowlists() {
+        // The shipped cloudflare service entry carries both a full-lifecycle
+        // method allowlist and a path-prefix allowlist confining the agent to
+        // /zones (DNS records, cache purge, firewall/rulesets) plus token verify.
+        // Parsing must preserve both so the http guards can enforce them.
+        let json = r#"{
+            "servers": {},
+            "services": {
+                "cloudflare": {
+                    "base_url": "https://api.cloudflare.com/client/v4",
+                    "auth": "bearer",
+                    "secret_name": "CloudflareToken",
+                    "allowed_methods": ["GET", "POST", "PUT", "PATCH", "DELETE"],
+                    "allowed_path_prefixes": ["/zones", "/user/tokens/verify"]
+                }
+            }
+        }"#;
+        let config: Config = serde_json::from_str(json).unwrap();
+        let cf = config.get_service("cloudflare").unwrap();
+
+        assert!(matches!(cf.auth, AuthScheme::Bearer));
+        assert_eq!(cf.secret_name, "CloudflareToken");
+        assert_eq!(
+            cf.allowed_methods.as_deref().unwrap(),
+            ["GET", "POST", "PUT", "PATCH", "DELETE"]
+        );
+        assert_eq!(
+            cf.allowed_path_prefixes.as_deref().unwrap(),
+            ["/zones", "/user/tokens/verify"]
+        );
+    }
+
+    #[test]
     fn test_get_and_list_names_operate_on_loaded_data() {
         let mut data = HashMap::new();
         data.insert("ApiKey".to_string(), "secret-value".to_string());
