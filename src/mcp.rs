@@ -1,5 +1,5 @@
 use crate::audit::AuditLog;
-use crate::config::{self, Config, Secrets};
+use crate::config::{self, Config, SecretStore};
 use crate::diff;
 use crate::http;
 use crate::scrubber;
@@ -65,6 +65,17 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock};
 
 pub fn run_server(initial_config: Config, config_path: String, audit_path: String) -> Result<()> {
+    // Surface a clear warning when the vault is configured for plaintext storage
+    // so operators don't unknowingly run with secrets unencrypted at rest. The
+    // secure default (Keychain) stays silent.
+    if initial_config.secret_backend() == config::SecretBackend::JsonFile {
+        error!(
+            "Secret vault backend is 'json': secrets are stored UNENCRYPTED on \
+             disk (0600 file permissions only). Set \"secret_backend\": \
+             \"keychain\" in the config to encrypt them at rest."
+        );
+    }
+
     let config = Arc::new(RwLock::new(initial_config));
     let pending: PendingStore = Arc::new(Mutex::new(HashSet::new()));
     let audit = Arc::new(AuditLog::open(&audit_path)?);
@@ -515,8 +526,10 @@ fn handle_request(
                             // redacts the injected secret from error text; run the
                             // message through the pattern scrubber as well so no
                             // data-bearing output reaches the agent unscrubbed.
-                            let scrubbed =
-                                scrubber::scrub_output(&format!("Error calling service: {}", e), &[]);
+                            let scrubbed = scrubber::scrub_output(
+                                &format!("Error calling service: {}", e),
+                                &[],
+                            );
                             error_result(scrubbed)
                         }
                     }
@@ -745,7 +758,7 @@ fn handle_request(
                                 format!("{}/.remote_connections/mcp_secrets.json", home)
                             });
 
-                            match Secrets::load(&secrets_path) {
+                            match SecretStore::load(config.secret_backend(), &secrets_path) {
                                 Ok(s) => {
                                     let names = s.list_names();
                                     (
@@ -819,7 +832,10 @@ fn handle_request(
                                             format!("{}/.remote_connections/mcp_secrets.json", home)
                                         });
 
-                                    let secret_value = match Secrets::load(&secrets_path) {
+                                    let secret_value = match SecretStore::load(
+                                        config.secret_backend(),
+                                        &secrets_path,
+                                    ) {
                                         Err(e) => {
                                             return JsonRpcResponse {
                                                 jsonrpc: "2.0".to_string(),

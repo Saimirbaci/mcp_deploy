@@ -19,3 +19,4 @@ sha2 = "0.10"
 regex = "1.10"
 sqlparser = "0.53"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls", "json"] }
+rpassword = "7"

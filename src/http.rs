@@ -1,4 +1,4 @@
-use crate::config::{AuthScheme, Config, Secrets, ServiceInfo};
+use crate::config::{AuthScheme, Config, SecretStore, ServiceInfo};
 use anyhow::{Context, Result, anyhow};
 use std::time::Duration;
 
@@ -210,7 +210,7 @@ pub fn call_service(
     // Load the credential value from the local vault. Never include the value in
     // any error message.
     let secrets_path = default_secrets_path()?;
-    let secrets = Secrets::load(&secrets_path)
+    let secrets = SecretStore::load(config.secret_backend(), &secrets_path)
         .with_context(|| format!("Failed to load secret vault from {}", secrets_path))?;
     let secret = secrets.get(&service.secret_name).ok_or_else(|| {
         anyhow!(
@@ -360,10 +360,14 @@ mod tests {
         // A read-only service must refuse a DELETE without touching the keychain
         // or the network (validation happens before secret load).
         let mut services = HashMap::new();
-        services.insert("ro".to_string(), service_with_guards(Some(vec!["GET"]), None));
+        services.insert(
+            "ro".to_string(),
+            service_with_guards(Some(vec!["GET"]), None),
+        );
         let config = Config {
             servers: HashMap::new(),
             services,
+            secret_backend: crate::config::SecretBackend::default(),
         };
         let err = call_service("ro", "DELETE", "/zones", None, None, &config).unwrap_err();
         assert!(err.to_string().contains("not permitted"));
@@ -379,9 +383,13 @@ mod tests {
         let config = Config {
             servers: HashMap::new(),
             services,
+            secret_backend: crate::config::SecretBackend::default(),
         };
         let err = call_service("confined", "GET", "/user/tokens", None, None, &config).unwrap_err();
-        assert!(err.to_string().contains("not within an allowed path prefix"));
+        assert!(
+            err.to_string()
+                .contains("not within an allowed path prefix")
+        );
     }
 
     #[test]
@@ -485,6 +493,7 @@ mod tests {
         let config = Config {
             servers: HashMap::new(),
             services: HashMap::new(),
+            secret_backend: crate::config::SecretBackend::default(),
         };
         let err = call_service("nope", "GET", "/", None, None, &config).unwrap_err();
         assert!(err.to_string().contains("not in the allowed services list"));
