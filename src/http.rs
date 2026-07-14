@@ -373,6 +373,103 @@ mod tests {
         assert!(err.to_string().contains("not permitted"));
     }
 
+    /// Build a ServiceInfo shaped like the shipped cloudflare entry: bearer auth,
+    /// full-lifecycle methods, and the /zones + /user/tokens/verify path allowlist.
+    fn cloudflare_service() -> ServiceInfo {
+        ServiceInfo {
+            base_url: "https://api.cloudflare.com/client/v4".to_string(),
+            auth: AuthScheme::Bearer,
+            secret_name: "CloudflareToken".to_string(),
+            extra: None,
+            allowed_methods: Some(
+                ["GET", "POST", "PUT", "PATCH", "DELETE"]
+                    .into_iter()
+                    .map(String::from)
+                    .collect(),
+            ),
+            allowed_path_prefixes: Some(
+                ["/zones", "/user/tokens/verify"]
+                    .into_iter()
+                    .map(String::from)
+                    .collect(),
+            ),
+        }
+    }
+
+    #[test]
+    fn cloudflare_guards_allow_dns_cache_waf_and_verify_paths() {
+        let cf = cloudflare_service();
+
+        // The full DNS/cache/WAF lifecycle surface lives under /zones, and the
+        // token sanity check under /user/tokens/verify — all must be permitted.
+        for path in [
+            "/zones",
+            "/zones/abc123",
+            "/zones/abc123/dns_records",
+            "/zones/abc123/dns_records/rec456",
+            "/zones/abc123/purge_cache",
+            "/zones/abc123/rulesets",
+            "/zones/abc123/firewall/rules",
+            "/user/tokens/verify",
+        ] {
+            assert!(
+                validate_path_allowed(&cf, path).is_ok(),
+                "expected {} to be allowed",
+                path
+            );
+        }
+
+        // Anything outside the confined surface is refused fail-closed, and a
+        // traversal segment is rejected even though it textually starts with /zones.
+        assert!(validate_path_allowed(&cf, "/accounts/abc/tokens").is_err());
+        assert!(validate_path_allowed(&cf, "/zones/../accounts").is_err());
+
+        // The full lifecycle of verbs is permitted (case-insensitive).
+        for method in ["GET", "post", "Put", "PATCH", "delete"] {
+            assert!(
+                validate_method_allowed(&cf, method).is_ok(),
+                "expected {} to be allowed",
+                method
+            );
+        }
+    }
+
+    #[test]
+    fn cloudflare_read_only_narrowing_rejects_writes() {
+        // Operators wanting read-only access narrow allowed_methods to ["GET"];
+        // verify that fail-closes against every write verb.
+        let mut ro = cloudflare_service();
+        ro.allowed_methods = Some(vec!["GET".to_string()]);
+
+        assert!(validate_method_allowed(&ro, "GET").is_ok());
+        for method in ["POST", "PUT", "PATCH", "DELETE"] {
+            assert!(
+                validate_method_allowed(&ro, method).is_err(),
+                "expected {} to be rejected by a read-only cloudflare entry",
+                method
+            );
+        }
+    }
+
+    #[test]
+    fn call_service_rejects_cloudflare_path_outside_allowlist_before_vault_access() {
+        // A request to a cloudflare path outside the /zones + verify allowlist must
+        // be refused before any keychain access or network call.
+        let mut services = HashMap::new();
+        services.insert("cloudflare".to_string(), cloudflare_service());
+        let config = Config {
+            servers: HashMap::new(),
+            services,
+            secret_backend: crate::config::SecretBackend::default(),
+        };
+        let err =
+            call_service("cloudflare", "GET", "/accounts/abc", None, None, &config).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("not within an allowed path prefix")
+        );
+    }
+
     #[test]
     fn call_service_rejects_disallowed_path_before_vault_access() {
         let mut services = HashMap::new();

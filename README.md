@@ -177,6 +177,101 @@ the value lives in the local vault and is injected server-side:
 - The `services` block is optional and additive — existing `servers`-only
   configs continue to load unchanged.
 
+#### Cloudflare (DNS, zones, cache purge, WAF)
+
+The shipped `cloudflare` service entry (see `sample_config.json`) lets the agent
+manage Cloudflare through `call_service_api` without ever seeing the token:
+
+```json
+"cloudflare": {
+  "base_url": "https://api.cloudflare.com/client/v4",
+  "auth": "bearer",
+  "secret_name": "CloudflareToken",
+  "allowed_methods": ["GET", "POST", "PUT", "PATCH", "DELETE"],
+  "allowed_path_prefixes": ["/zones", "/user/tokens/verify"]
+}
+```
+
+The `/zones` prefix covers the full surface this ticket targets — DNS records
+(`/zones/{id}/dns_records`), cache purge (`/zones/{id}/purge_cache`), and
+firewall/WAF rules (`/zones/{id}/rulesets`, `/zones/{id}/firewall/...`) — while
+`/user/tokens/verify` permits the token sanity check. For **read-only** access,
+narrow `allowed_methods` to `["GET"]`.
+
+**Token (use a scoped API token, NOT the global API key).** Create a scoped
+token at <https://dash.cloudflare.com/profile/api-tokens> with, for the relevant
+zone(s):
+
+- `Zone : DNS : Edit`
+- `Zone : Cache Purge : Purge`
+- `Zone : Read`
+- *(optional, for WAF/firewall)* `Zone : Firewall Services : Edit`
+
+Recommended hardening on the token itself: restrict it to specific zones, set an
+**IP allowlist**, and give it a **TTL/expiry**. The global API key is
+account-wide and must never be used here.
+
+Store the token in the local vault under the name `CloudflareToken` (the value is
+read via a no-echo prompt or piped from stdin — never passed as an argument):
+
+```bash
+# Interactive (no-echo prompt)
+mcp_deploy secret add CloudflareToken
+
+# Or piped for scripted use
+printf '<scoped-cloudflare-token>' | mcp_deploy secret add CloudflareToken
+
+# Confirm it is present by name only (the value is never printed)
+mcp_deploy secret list
+```
+
+**Recipes** (the agent only ever names the service; the token is injected
+server-side and redacted out of every response):
+
+```jsonc
+// 1. Verify the token is active
+{ "service": "cloudflare", "method": "GET", "path": "/user/tokens/verify" }
+
+// 2. Find your zone id (lists zones; filter by name with a query param)
+{ "service": "cloudflare", "method": "GET", "path": "/zones",
+  "query": { "name": "example.com" } }
+
+// 3. List DNS records in a zone
+{ "service": "cloudflare", "method": "GET",
+  "path": "/zones/{zone_id}/dns_records" }
+
+// 4. Add an A record
+{ "service": "cloudflare", "method": "POST",
+  "path": "/zones/{zone_id}/dns_records",
+  "body": { "type": "A", "name": "test.example.com",
+            "content": "203.0.113.10", "ttl": 120, "proxied": false } }
+
+// 5. Update (PATCH) an existing record
+{ "service": "cloudflare", "method": "PATCH",
+  "path": "/zones/{zone_id}/dns_records/{record_id}",
+  "body": { "content": "203.0.113.20", "ttl": 300 } }
+
+// 6. Delete a record
+{ "service": "cloudflare", "method": "DELETE",
+  "path": "/zones/{zone_id}/dns_records/{record_id}" }
+
+// 7. Purge the entire cache for a zone
+{ "service": "cloudflare", "method": "POST",
+  "path": "/zones/{zone_id}/purge_cache",
+  "body": { "purge_everything": true } }
+
+// 7b. Or purge only specific URLs
+{ "service": "cloudflare", "method": "POST",
+  "path": "/zones/{zone_id}/purge_cache",
+  "body": { "files": ["https://example.com/style.css"] } }
+```
+
+Cloudflare returns `{"success": true, "result": ...}` on success and a non-2xx
+status with an `errors` array on failure; on a non-2xx the body is still returned
+to the agent (flagged `isError`) for debugging. Replace `{zone_id}` and
+`{record_id}` with values discovered via recipes 2–3. See the
+[Cloudflare API token permissions reference](https://developers.cloudflare.com/fundamentals/api/reference/permissions/).
+
 ### The Secret Vault (Encrypted at Rest by Default, Selectable Backend)
 The local secret vault holds the API keys and tokens that the MCP server injects
 into SSH `.env` deploys and outbound `call_service_api` requests. The agent only
