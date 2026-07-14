@@ -641,6 +641,38 @@ mod tests {
     }
 
     #[test]
+    fn test_sample_config_resend_services_load() {
+        // The shipped sample_config.json must define the two Resend service
+        // aliases (sending-only vs full-access) and load cleanly through the
+        // schema, exercising the same code path real deployments use.
+        let manifest_dir = env!("CARGO_MANIFEST_DIR");
+        let sample_path = format!("{manifest_dir}/sample_config.json");
+        let raw = fs::read_to_string(&sample_path)
+            .expect("sample_config.json must ship with the crate");
+
+        let config: Config =
+            serde_json::from_str(&raw).expect("sample_config.json must parse cleanly");
+
+        // Sending-only alias.
+        let send = config
+            .services
+            .get("resend")
+            .expect("'resend' service must be defined");
+        assert_eq!(send.base_url, "https://api.resend.com");
+        assert!(matches!(send.auth, AuthScheme::Bearer));
+        assert_eq!(send.secret_name, "ResendSendKey");
+
+        // Full-access alias for domain/key/audience management.
+        let admin = config
+            .services
+            .get("resend_admin")
+            .expect("'resend_admin' service must be defined");
+        assert_eq!(admin.base_url, "https://api.resend.com");
+        assert!(matches!(admin.auth, AuthScheme::Bearer));
+        assert_eq!(admin.secret_name, "ResendAdminKey");
+    }
+
+    #[test]
     fn test_get_and_list_names_operate_on_loaded_data() {
         let mut data = HashMap::new();
         data.insert("ApiKey".to_string(), "secret-value".to_string());

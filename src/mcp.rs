@@ -317,6 +317,10 @@ fn handle_request(
                                     "type": "object",
                                     "description": "Optional query-string parameters as a flat object of string/number/bool values."
                                 },
+                                "headers": {
+                                    "type": "object",
+                                    "description": "Optional caller-supplied request headers as a flat object of string values. RESTRICTED ALLOWLIST: only idempotency-style headers are passed through (currently 'X-Idempotency-Key' / 'Idempotency-Key'); any other header (including 'Authorization') is silently dropped so the injected credential can never be overridden."
+                                },
                                 "body": {
                                     "description": "Optional request body for write methods, as a JSON object or a raw string."
                                 }
@@ -505,9 +509,10 @@ fn handle_request(
                     let method = arguments["method"].as_str().unwrap_or("");
                     let path = arguments["path"].as_str().unwrap_or("");
                     let query = arguments.get("query").filter(|v| !v.is_null());
+                    let headers = arguments.get("headers").filter(|v| !v.is_null());
                     let body = arguments.get("body").filter(|v| !v.is_null());
 
-                    match http::call_service(service, method, path, query, body, config) {
+                    match http::call_service(service, method, path, query, headers, body, config) {
                         Ok(resp) => {
                             // Defense-in-depth: the http layer already redacts the
                             // injected secret; run the body through the pattern

@@ -45,9 +45,17 @@
     },
     "resend": {
       "base_url": "https://api.resend.com",
-      "auth": { "header": { "name": "Authorization" } },
-      "secret_name": "ResendKey",
-      "allowed_methods": ["GET"]
+      "auth": "bearer",
+      "secret_name": "ResendSendKey",
+      "allowed_methods": ["GET", "POST"],
+      "allowed_path_prefixes": ["/emails"]
+    },
+    "resend_admin": {
+      "base_url": "https://api.resend.com",
+      "auth": "bearer",
+      "secret_name": "ResendAdminKey",
+      "allowed_methods": ["GET", "POST", "PUT", "PATCH", "DELETE"],
+      "allowed_path_prefixes": ["/emails", "/domains", "/api-keys", "/audiences", "/broadcasts", "/webhooks"]
     }
   }
 }
