@@ -637,6 +637,26 @@ mod tests {
         assert!(err.to_string().contains("not in the allowed services list"));
     }
 
+    #[test]
+    fn caller_headers_filters_to_allowlist_and_stringifies_scalars() {
+        let input = serde_json::json!({
+            "X-Idempotency-Key": "send-123",
+            "Idempotency-Key": 456,
+            "Authorization": "Bearer attacker",
+            "X-Other": "nope",
+            "Nested": { "a": 1 }
+        });
+        let mut pairs = caller_headers(Some(&input));
+        pairs.sort();
+        assert_eq!(
+            pairs,
+            vec![
+                ("Idempotency-Key".to_string(), "456".to_string()),
+                ("X-Idempotency-Key".to_string(), "send-123".to_string()),
+            ]
+        );
+    }
+
     /// Resend sending-only service: bearer auth, GET+POST only, confined to /emails.
     fn resend_send_service() -> ServiceInfo {
         ServiceInfo {
