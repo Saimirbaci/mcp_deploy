@@ -698,8 +698,9 @@ mod tests {
     fn resend_send_service_confines_to_emails_and_rejects_admin_paths() {
         let send = resend_send_service();
 
-        // Single send, batch send, and (read-side) retrieval all live under /emails.
-        for path in ["/emails", "/emails/batch"] {
+        // Single send, batch send, (read-side) retrieval, and a trailing-slash
+        // variant all live under /emails and must be permitted.
+        for path in ["/emails", "/emails/", "/emails/batch"] {
             assert!(
                 validate_path_allowed(&send, path).is_ok(),
                 "expected {path} to be allowed for the sending-only key"
@@ -719,6 +720,7 @@ mod tests {
             // also be refused (e.g. `/emails2` must not match the `/emails` prefix).
             "/emails2",
             "/domains2",
+            "/emails-admin",
         ] {
             assert!(
                 validate_path_allowed(&send, path).is_err(),
