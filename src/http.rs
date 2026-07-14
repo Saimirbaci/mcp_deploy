@@ -98,9 +98,10 @@ fn validate_path_allowed(service: &ServiceInfo, path: &str) -> Result<()> {
         && !prefixes.is_empty()
     {
         let normalized = normalize_leading_slash(path);
-        let ok = prefixes
-            .iter()
-            .any(|p| normalized.starts_with(&normalize_leading_slash(p)));
+        let ok = prefixes.iter().any(|p| {
+            let prefix = normalize_leading_slash(p);
+            normalized == prefix || normalized.starts_with(&format!("{}/", prefix))
+        });
         if !ok {
             return Err(anyhow!(
                 "Request path '{}' is not within an allowed path prefix for this service",
@@ -714,6 +715,10 @@ mod tests {
             "/audiences/abc/contacts",
             "/broadcasts",
             "/webhooks",
+            // Paths that share a prefix but differ at a non-'/' boundary must
+            // also be refused (e.g. `/emails2` must not match the `/emails` prefix).
+            "/emails2",
+            "/domains2",
         ] {
             assert!(
                 validate_path_allowed(&send, path).is_err(),
