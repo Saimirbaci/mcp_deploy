@@ -319,10 +319,10 @@ fn handle_request(
                                 },
                                 "headers": {
                                     "type": "object",
-                                    "description": "Optional caller-supplied request headers as a flat object of string values. RESTRICTED ALLOWLIST: only idempotency-style headers are passed through (currently 'X-Idempotency-Key' / 'Idempotency-Key'); any other header (including 'Authorization') is silently dropped so the injected credential can never be overridden."
+                                    "description": "Optional caller-supplied request headers as a flat object of string/number/bool values. Only 'X-Idempotency-Key' and 'Idempotency-Key' are passed through; all other headers (including 'Authorization') are dropped so injected credentials cannot be overridden."
                                 },
                                 "body": {
-                                    "description": "Optional request body for write methods, as a JSON object or a raw string."
+                                    "description": "Optional request body for write methods. If the value is a JSON string it is sent as a raw body; otherwise it is sent as a JSON document (objects, arrays, numbers, bools)."
                                 }
                             },
                             "required": ["service", "method", "path"]
