@@ -31,6 +31,17 @@ static PATTERNS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
         r"\bxox[baprs]-[0-9A-Za-z-]{10,}\b",
         // OpenRouter provisioning/runtime API keys (e.g. sk-or-v1-<64 hex chars>).
         r"\bsk-or-v1-[0-9a-fA-F]{32,}\b",
+        // Google OAuth2 access tokens (e.g. from gcloud auth print-access-token
+        // or embedded in describe/metadata output).
+        r"\bya29\.[0-9A-Za-z_-]{20,}\b",
+        // Google OAuth2 refresh tokens (e.g. "1//0<...>").
+        r"\b1//[0-9A-Za-z_-]{15,}\b",
+        // A service-account JSON key's "private_key" field. Belt-and-suspenders
+        // alongside the PEM-block pattern above, which already matches the PEM
+        // body itself once JSON string escapes (\n) are considered — this
+        // pattern also redacts the surrounding `"private_key": "..."` field
+        // wrapper in one pass.
+        r#""private_key"\s*:\s*"(?:\\.|[^"\\])*""#,
     ];
 
     sources
@@ -144,6 +155,41 @@ mod tests {
         // A /models catalog response or doc text that mentions the "sk-or-"
         // prefix without the full key shape must not be redacted.
         let text = "provider prefix is sk-or- and model id is openrouter/auto";
+        assert_eq!(scrub_output(text, &[]), text);
+    }
+
+    #[test]
+    fn test_redacts_gcp_oauth_access_token() {
+        let token = "ya29.a0AfB_byC1234567890abcdefghijklmnopqrstuvwxyz";
+        let out = scrub_output(&format!("access_token: {}", token), &[]);
+        assert!(!out.contains(token));
+        assert!(out.contains(REDACTED));
+    }
+
+    #[test]
+    fn test_redacts_gcp_oauth_refresh_token() {
+        let token = "1//0gAbCdEfGhIjKlMnOpQrStUvWxYz1234567890";
+        let out = scrub_output(&format!("refresh_token: {}", token), &[]);
+        assert!(!out.contains(token));
+        assert!(out.contains(REDACTED));
+    }
+
+    #[test]
+    fn test_redacts_service_account_private_key_field() {
+        let text = "{\"type\": \"service_account\", \"private_key\": \"-----BEGIN PRIVATE KEY-----\\nabc123\\n-----END PRIVATE KEY-----\\n\", \"client_email\": \"x@y.iam.gserviceaccount.com\"}";
+        let out = scrub_output(text, &[]);
+        assert!(!out.contains("BEGIN PRIVATE KEY"));
+        assert!(!out.contains("abc123"));
+        // The rest of the JSON (non-secret fields) must survive.
+        assert!(out.contains("client_email"));
+        assert!(out.contains(REDACTED));
+    }
+
+    #[test]
+    fn test_leaves_gcp_near_misses_untouched() {
+        // "ya29" alone (no dot/token body) and a benign scope string containing
+        // "1// " with a space, not the refresh-token shape, must not be redacted.
+        let text = "provider is ya29 auth and comment says 1// this is just a code comment";
         assert_eq!(scrub_output(text, &[]), text);
     }
 
