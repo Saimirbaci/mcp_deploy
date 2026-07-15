@@ -486,6 +486,21 @@ pub fn known_secret_values(config: &Config, target: &str) -> Vec<String> {
     }
 }
 
+/// Loads the literal vault secret values from the shared/default vault (the
+/// one used by `call_service_api` and `gcloud_command`, neither of which is
+/// tied to a particular `servers` entry) so they can be scrubbed out of tool
+/// output the same way `known_secret_values` does for SSH targets. Failures
+/// (missing/unreadable vault) yield an empty list — scrubbing then falls back
+/// to pattern matching only.
+pub fn known_shared_secret_values(config: &Config) -> Vec<String> {
+    let home = std::env::var("HOME").unwrap_or_default();
+    let secrets_path = format!("{}/.remote_connections/mcp_secrets.json", home);
+    match SecretStore::load(config.secret_backend(), &secrets_path) {
+        Ok(s) => s.values(),
+        Err(_) => Vec::new(),
+    }
+}
+
 impl Config {
     pub fn load<P: AsRef<Path>>(path: P) -> Result<Self> {
         let content = fs::read_to_string(path).context("Failed to read config file")?;

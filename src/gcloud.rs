@@ -12,6 +12,7 @@ use anyhow::{Context, Result, anyhow};
 use std::io::{Read, Write};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
+use tempfile::NamedTempFile;
 
 /// Non-streaming, bounded execution time budget for a single `gcloud` call,
 /// mirroring `run_command`'s non-interactive/non-streaming constraint.
@@ -36,46 +37,28 @@ fn default_secrets_path() -> Result<String> {
     Ok(format!("{}/.remote_connections/mcp_secrets.json", home))
 }
 
-/// A temp file that deletes itself on drop, regardless of how the enclosing
-/// scope exits — guarantees the materialized service-account key JSON never
-/// lingers on disk beyond the activation call, even on an early error return.
-struct TempKeyFile {
-    path: std::path::PathBuf,
-}
-
-impl Drop for TempKeyFile {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
-    }
-}
-
-/// Materialize the service-account key JSON to a 0600 temp file.
-fn write_temp_key_file(key_json: &str) -> Result<TempKeyFile> {
-    let mut path = std::env::temp_dir();
-    path.push(format!("mcp_deploy_gcp_key_{}.json", std::process::id()));
-
-    let mut opts = std::fs::OpenOptions::new();
-    opts.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o600);
-    }
-    let mut f = opts
-        .open(&path)
-        .context("Failed to open temporary service-account key file")?;
-    f.write_all(key_json.as_bytes())
+/// Materialize the service-account key JSON to a securely-created,
+/// exclusively-opened temp file (0600 on unix by default). Using
+/// `tempfile::NamedTempFile` rather than a PID-derived path opened with
+/// `create(true)` closes a symlink-race window: a co-resident local user
+/// could otherwise pre-create a symlink at a predictable
+/// `temp_dir()/mcp_deploy_gcp_key_<pid>.json` path (the PID is not secret)
+/// and have the service-account key written through it into an arbitrary
+/// target file. `NamedTempFile` creates its (randomly-named) file with
+/// `O_EXCL` semantics, which refuses to follow a pre-existing symlink.
+/// Deleted automatically on drop, regardless of how the enclosing scope
+/// exits, so the key JSON never lingers on disk beyond the activation call.
+fn write_temp_key_file(key_json: &str) -> Result<NamedTempFile> {
+    let mut file = tempfile::Builder::new()
+        .prefix("mcp_deploy_gcp_key_")
+        .suffix(".json")
+        .tempfile()
+        .context("Failed to create temporary service-account key file")?;
+    file.write_all(key_json.as_bytes())
         .context("Failed to write service-account key to temp file")?;
-    f.sync_all().ok();
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
-            .context("Failed to set key file permissions")?;
-    }
-
-    Ok(TempKeyFile { path })
+    file.flush()
+        .context("Failed to flush service-account key to temp file")?;
+    Ok(file)
 }
 
 /// Pre-authenticate the pinned service account into an isolated
@@ -104,7 +87,7 @@ pub fn activate_service_account(gcp: &GcpConfig, config: &Config) -> Result<()> 
     let output = Command::new("gcloud")
         .arg("auth")
         .arg("activate-service-account")
-        .arg(format!("--key-file={}", temp_key.path.display()))
+        .arg(format!("--key-file={}", temp_key.path().display()))
         .arg(format!("--project={}", gcp.project_id))
         .env("CLOUDSDK_CONFIG", &cloudsdk_config_dir)
         .output()
@@ -142,9 +125,13 @@ pub fn build_gcloud_argv(args: &[String], gcp: &GcpConfig) -> Vec<String> {
 
     // Only `compute instances` and `compute disks` are zonal among the
     // allow-listed resource groups; firewall-rules/snapshots/images/networks
-    // are global and must not get a spurious --zone appended.
-    let is_zonal =
-        out.len() >= 2 && out[0] == "compute" && matches!(out[1].as_str(), "instances" | "disks");
+    // are global and must not get a spurious --zone appended. Compared
+    // lowercase to match `gcloud_guard::validate_gcloud_args`'s
+    // case-insensitive comparison, so mixed-case argv is treated consistently
+    // by both guards.
+    let is_zonal = out.len() >= 2
+        && out[0].eq_ignore_ascii_case("compute")
+        && matches!(out[1].to_ascii_lowercase().as_str(), "instances" | "disks");
     if is_zonal
         && !has_flag(&out, "--zone")
         && !has_flag(&out, "--region")
@@ -196,6 +183,11 @@ pub fn run_gcloud(args: &[String], gcp: &GcpConfig) -> Result<GcloudOutput> {
             None if Instant::now() >= deadline => {
                 let _ = child.kill();
                 let _ = child.wait();
+                // Join the drain threads (they unblock once the killed
+                // child's pipes close) for consistency with the success
+                // path below, rather than leaving them to be dropped.
+                let _ = stdout_handle.join();
+                let _ = stderr_handle.join();
                 return Err(anyhow!(
                     "gcloud command timed out after {} seconds",
                     GCLOUD_TIMEOUT.as_secs()
@@ -231,6 +223,39 @@ mod tests {
             key_secret_name: "GcpServiceAccountKey".to_string(),
             cloudsdk_config_dir: None,
         }
+    }
+
+    #[test]
+    fn write_temp_key_file_writes_content_with_owner_only_permissions() {
+        let file = write_temp_key_file(r#"{"type":"service_account"}"#).unwrap();
+        let path = file.path().to_path_buf();
+        assert!(path.exists());
+        let on_disk = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(on_disk, r#"{"type":"service_account"}"#);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "key temp file must be 0600, got {:o}", mode);
+        }
+
+        // Dropping the handle deletes the file (no lingering key material).
+        drop(file);
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn write_temp_key_file_does_not_reuse_a_predictable_pid_derived_path() {
+        // Regression test for the symlink-race fix: the old implementation
+        // used a fully predictable `temp_dir()/mcp_deploy_gcp_key_<pid>.json`
+        // path opened non-exclusively, which a co-resident local user could
+        // pre-create as a symlink to redirect the key write. The securely
+        // created temp file's name must not match that predictable pattern.
+        let file = write_temp_key_file("test").unwrap();
+        let predictable =
+            std::env::temp_dir().join(format!("mcp_deploy_gcp_key_{}.json", std::process::id()));
+        assert_ne!(file.path(), predictable);
     }
 
     #[test]

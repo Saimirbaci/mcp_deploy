@@ -143,12 +143,17 @@ Or specify a custom config path:
      local vault; the MCP server activates it once at startup into an isolated
      `CLOUDSDK_CONFIG` directory and the key is never returned to the agent or
      written to logs.
-   - **Scope**: only `compute instances`, `compute disks`, `compute firewall-rules`,
-     `compute snapshots`, `compute images`, and `compute networks` are permitted.
-     `auth`, `iam`, `billing`, `projects`, `kms`, `secrets`, `resource-manager`,
-     `organizations`, `config`, and identity-pivoting flags (`--account`,
-     `--impersonate-service-account`, `--key-file`, `--configuration`,
-     `--credential-file-override`) are always refused, before any subprocess runs.
+   - **Scope**: both the resource group *and* the verb are allow-listed (see the
+     table below) — `compute instances` permits lifecycle verbs (list, start,
+     stop, reset, delete, create, resize) but not metadata-mutating verbs on
+     existing instances; `compute firewall-rules`/`images`/`networks` are
+     read-only. `auth`, `iam`, `billing`, `projects`, `kms`, `secrets`,
+     `resource-manager`, `organizations`, `config`, identity/project-pivoting
+     flags (`--account`, `--impersonate-service-account`, `--key-file`,
+     `--configuration`, `--credential-file-override`, `--project`), and any
+     flag that reads from or writes to an arbitrary local file
+     (`--metadata-from-file`, `--flags-file`, `--destination`, any
+     `*-file`/`*-from-file` flag) are always refused, before any subprocess runs.
    - **Non-interactive/non-streaming**, bounded to 60 seconds, mirroring
      `run_command`.
 
@@ -529,8 +534,8 @@ rm /tmp/mcp-deploy-key.json
 ```
 
 - `project_id` is pinned into every `gcloud` call (`--project`); it cannot be
-  overridden by the agent (`config`/`projects` subcommands and `--account` are
-  always refused).
+  overridden by the agent (`config`/`projects` subcommands and a
+  caller-supplied `--project`/`--account` flag are always refused).
 - `default_zone` / `default_region` are injected automatically for zonal
   resources (`compute instances`, `compute disks`) when the caller's `args`
   don't already specify one.
@@ -543,6 +548,35 @@ rm /tmp/mcp-deploy-key.json
   service account once. A missing binary or bad key logs a clear error to
   `stderr` without crashing the server — other tools (SSH, HTTP) keep working;
   `gcloud_command` calls simply fail individually until it's fixed.
+- **Hot-reload does NOT re-authenticate GCP.** Unlike `servers`/`services`,
+  activation happens once at startup only. Adding a `gcp` block, rotating
+  `key_secret_name`, or changing `project_id` via a config hot-reload changes
+  what argv is *built* (the reloaded `project_id` is still injected), but the
+  gcloud identity actually authenticated in `CLOUDSDK_CONFIG` stays whatever
+  was activated at startup — **restart the server** for a credential
+  rotation or a newly-added `gcp` block to actually take effect.
+
+**Scope is narrower than "all of `compute instances`/`disks`/etc.":** the
+allow-list restricts both the resource group *and* the verb, and denies any
+flag that reads from or writes to an arbitrary local file, so that this tool
+cannot be used to pivot beyond ordinary instance/disk lifecycle management:
+
+| Resource group | Allowed verbs | Why not more |
+|---|---|---|
+| `compute instances` | `list`, `describe`, `start`, `stop`, `reset`, `delete`, `create`, `set-machine-type` | `add-metadata`/`remove-metadata`/`update` are refused — they would let the agent inject an SSH key or startup-script into **any** existing instance in the project, bypassing the SSH IP/alias whitelist entirely. `export`/`import` are refused — they read/write an attacker-chosen local file path. |
+| `compute disks` | `list`, `describe`, `create`, `delete`, `resize` | — |
+| `compute firewall-rules` | `list`, `describe` (read-only) | `create`/`update`/`delete` are refused — they could expose any instance in the project to the public internet (e.g. `--allow=tcp:22 --source-ranges=0.0.0.0/0`). |
+| `compute snapshots` | `list`, `describe`, `create`, `delete` | — |
+| `compute images` | `list`, `describe` (read-only) | — |
+| `compute networks` | `list`, `describe` (read-only) | Same reasoning as firewall-rules. |
+
+Additionally, **any flag that loads content from a local file is always
+refused**, regardless of verb — `--metadata-from-file`, `--flags-file`, any
+other `*-file`/`*-from-file` flag, and `--destination` (used by the now-denied
+`export`). This closes the exfiltration path where a local secrets file (e.g.
+this project's own `~/.remote_connections/mcp_secrets.json`) could otherwise
+be read into instance metadata at `create` time and then read back via an
+allowed `describe` call.
 
 **Recipes** (the agent only ever passes `args`; the service account is already
 activated):
@@ -572,8 +606,10 @@ activated):
 { "args": ["compute", "instances", "set-machine-type", "my-vm",
            "--machine-type=e2-small"] }
 
-// 8. Disks, firewall rules, and snapshots are also in scope
+// 8. Disks and snapshots also support lifecycle verbs; firewall-rules,
+//    images, and networks are read-only (list/describe only)
 { "args": ["compute", "disks", "list"] }
+{ "args": ["compute", "disks", "resize", "my-disk", "--size=100GB"] }
 { "args": ["compute", "firewall-rules", "list"] }
 { "args": ["compute", "snapshots", "list"] }
 ```
@@ -588,13 +624,22 @@ activated):
            "--account=someone-else@x.iam.gserviceaccount.com"] } // identity pivot
 { "args": ["compute", "instances", "list",
            "--project=some-other-project"] }                     // project pinning bypass
+{ "args": ["compute", "instances", "add-metadata", "any-vm",
+           "--metadata=ssh-keys=attacker:ssh-rsa AAAA..."] }      // SSH-key injection into any instance
+{ "args": ["compute", "firewall-rules", "create", "allow-ssh",
+           "--allow=tcp:22", "--source-ranges=0.0.0.0/0"] }       // opens the project to the internet
+{ "args": ["compute", "instances", "create", "new-vm",
+           "--metadata-from-file=leak=/Users/you/.remote_connections/mcp_secrets.json"] } // local file exfiltration
 ```
 
 **The service-account key is never echoed to agent-visible output**: it is
 loaded from the vault only inside `activate_service_account`, materialized to a
-`0600` temp file for the duration of that single call, then deleted; the key
+securely-created (`O_EXCL`, 0600), unpredictably-named temp file for the
+duration of that single call via the `tempfile` crate, then deleted; the key
 never appears in `gcloud_command` output, error messages, or the audit log
-(which records only the argv, never credentials).
+(which records only the argv, never credentials). `gcloud_command` output is
+scrubbed with the same two layers as `run_command`/`read_remote_file` — known
+vault secret values plus format-based patterns — before it reaches the agent.
 
 **Manual testing** (operator use, outside an MCP client):
 

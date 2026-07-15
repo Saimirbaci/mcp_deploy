@@ -81,6 +81,18 @@ pub fn run_server(initial_config: Config, config_path: String, audit_path: Strin
     // working; gcloud_command calls simply fail individually with a clear
     // error until this is resolved (mirrors how a missing `services` block
     // doesn't break run_command).
+    //
+    // IMPORTANT: unlike `servers`/`services`, the `gcp` block is NOT
+    // re-activated on config hot-reload (see the file watcher below, which
+    // only swaps the in-memory `Config`). Adding a `gcp` block, rotating
+    // `key_secret_name`, or changing `project_id` via hot-reload updates
+    // what `gcloud_command` argv is *built* against (build_gcloud_argv reads
+    // the live config), but the *activated* gcloud identity in
+    // CLOUDSDK_CONFIG stays whatever was authenticated at startup until the
+    // process is restarted — a credential-rotation response is not
+    // complete until then. This mirrors, but is stricter than, this
+    // project's general "hot-reload for non-critical updates only"
+    // guidance (see CLAUDE.md).
     if let Some(gcp) = initial_config.gcp() {
         match std::process::Command::new("gcloud")
             .arg("--version")
@@ -517,7 +529,7 @@ fn handle_request(
                     },
                     {
                         "name": "gcloud_command",
-                        "description": "Runs a `gcloud` command locally against a pre-authenticated GCP service account to manage Compute Engine resources. BLIND-CREDENTIAL MODEL: the service-account key lives only in the local vault and is never returned to you or written to logs; this server activates it once at startup. NON-INTERACTIVE/NON-STREAMING, bounded (mirrors run_command). ARGV, NOT A SHELL STRING: 'args' is a JSON array of the gcloud subcommand and flags (e.g. ['compute','instances','list']) — shell operators like pipes or && are not supported and will not be interpreted. SCOPE: only 'compute instances', 'compute disks', 'compute firewall-rules', 'compute snapshots', 'compute images', and 'compute networks' are permitted; 'auth', 'iam', 'billing', 'projects', 'kms', 'secrets', 'resource-manager', 'organizations', and 'config' are always refused, as are identity-pivoting flags like --account/--impersonate-service-account/--key-file.",
+                        "description": "Runs a `gcloud` command locally against a pre-authenticated GCP service account to manage Compute Engine resources. BLIND-CREDENTIAL MODEL: the service-account key lives only in the local vault and is never returned to you or written to logs; this server activates it once at startup. NON-INTERACTIVE/NON-STREAMING, bounded (mirrors run_command). ARGV, NOT A SHELL STRING: 'args' is a JSON array of the gcloud subcommand and flags (e.g. ['compute','instances','list']) — shell operators like pipes or && are not supported and will not be interpreted. SCOPE (resource group AND verb are both restricted): 'compute instances' allows list/describe/start/stop/reset/delete/create/set-machine-type only (add-metadata/remove-metadata/update/export/import are refused — they can pivot to instances outside your control or touch arbitrary local files); 'compute disks' allows list/describe/create/delete/resize; 'compute firewall-rules', 'compute images', and 'compute networks' are READ-ONLY (list/describe only — no create/update/delete, since that could expose instances to the public internet); 'compute snapshots' allows list/describe/create/delete. 'auth', 'iam', 'billing', 'projects', 'kms', 'secrets', 'resource-manager', and 'config' are always refused, as are identity/project-pivoting flags (--account/--impersonate-service-account/--key-file/--project/--configuration) and any flag that reads from or writes to an arbitrary local file (--metadata-from-file, --flags-file, --destination, any *-file/*-from-file flag).",
                         "inputSchema": {
                             "type": "object",
                             "properties": {
@@ -1041,10 +1053,16 @@ fn handle_request(
                             if let Err(e) = crate::gcloud_guard::validate_gcloud_args(&args) {
                                 error_result(format!("{}", e))
                             } else {
+                                // Scrub with both layers, matching scrub_for_target: the
+                                // shared vault's literal secret values (the GCP key and any
+                                // service-api credentials) plus the format-based patterns.
+                                let known_secrets = config::known_shared_secret_values(config);
                                 match crate::gcloud::run_gcloud(&args, gcp) {
                                     Ok(output) => {
-                                        let stdout = scrubber::scrub_output(&output.stdout, &[]);
-                                        let stderr = scrubber::scrub_output(&output.stderr, &[]);
+                                        let stdout =
+                                            scrubber::scrub_output(&output.stdout, &known_secrets);
+                                        let stderr =
+                                            scrubber::scrub_output(&output.stderr, &known_secrets);
                                         let text = format!(
                                             "exit_code: {}\nstdout:\n{}\nstderr:\n{}",
                                             output.exit_code, stdout, stderr
@@ -1057,7 +1075,7 @@ fn handle_request(
                                     }
                                     Err(e) => error_result(format!(
                                         "Failed to run gcloud command: {}",
-                                        scrubber::scrub_output(&e.to_string(), &[])
+                                        scrubber::scrub_output(&e.to_string(), &known_secrets)
                                     )),
                                 }
                             }
