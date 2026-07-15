@@ -149,9 +149,10 @@ the value lives in the local vault and is injected server-side:
   },
   "resend": {
     "base_url": "https://api.resend.com",
-    "auth": { "header": { "name": "Authorization" } },
-    "secret_name": "ResendKey",
-    "allowed_methods": ["GET"]
+    "auth": "bearer",
+    "secret_name": "ResendSendKey",
+    "allowed_methods": ["GET", "POST"],
+    "allowed_path_prefixes": ["/emails"]
   }
 }
 ```
@@ -271,6 +272,122 @@ status with an `errors` array on failure; on a non-2xx the body is still returne
 to the agent (flagged `isError`) for debugging. Replace `{zone_id}` and
 `{record_id}` with values discovered via recipes 2–3. See the
 [Cloudflare API token permissions reference](https://developers.cloudflare.com/fundamentals/api/reference/permissions/).
+
+#### Resend (email sending + domains/keys/audiences management)
+
+Resend offers **two API-key scopes**, and this server ships a service alias for
+each so the agent never holds a broader privilege than the task requires:
+
+| Alias           | Secret name     | Key scope        | Use for                                   |
+|-----------------|-----------------|------------------|-------------------------------------------|
+| `resend`        | `ResendSendKey` | `sending_access` | Single/batch/scheduled email sends only.  |
+| `resend_admin`  | `ResendAdminKey`| `full_access`    | Domains, API keys, audiences, broadcasts, webhooks (and sending). |
+
+Both use `bearer` auth — the server injects `Authorization: Bearer <key>` from
+the vault and redacts the value from every response. Define both in
+`sample_config.json` (mirroring what ships in this repo):
+
+```json
+"services": {
+  "resend": {
+    "base_url": "https://api.resend.com",
+    "auth": "bearer",
+    "secret_name": "ResendSendKey",
+    "allowed_methods": ["GET", "POST"],
+    "allowed_path_prefixes": ["/emails"]
+  },
+  "resend_admin": {
+    "base_url": "https://api.resend.com",
+    "auth": "bearer",
+    "secret_name": "ResendAdminKey",
+    "allowed_methods": ["GET", "POST", "PUT", "PATCH", "DELETE"],
+    "allowed_path_prefixes": ["/emails", "/domains", "/api-keys", "/audiences", "/broadcasts", "/webhooks"]
+  }
+}
+```
+
+The allowlists are enforced **fail-closed**: a request to `POST /domains` via
+the `resend` (sending-only) alias is refused before the key is ever loaded from
+the vault, so a leak of `ResendSendKey` cannot mutate your account.
+
+**Create the two keys** at <https://resend.com/api-keys> — one scoped to
+`sending_access`, one to `full_access` — and store each under its name (value is
+read via a no-echo prompt or piped; never as an argument):
+
+```bash
+mcp_deploy secret add ResendSendKey    # sending_access
+mcp_deploy secret add ResendAdminKey   # full_access
+mcp_deploy secret list                 # confirms names only; values never printed
+```
+
+**Send + domain-verify recipes** (the agent only ever names the service; the key
+is injected server-side and redacted from responses):
+
+```jsonc
+// 1. Send a single email (uses the sending-only key)
+{ "service": "resend", "method": "POST", "path": "/emails",
+  "body": { "from": "you@yourdomain.com", "to": "user@example.com",
+            "subject": "Hello", "text": "from Secure Deploy" },
+  "headers": { "X-Idempotency-Key": "send-123" } }
+
+// 2. Batch send (up to 100 messages per request)
+{ "service": "resend", "method": "POST", "path": "/emails/batch",
+  "body": [
+    { "from": "you@yourdomain.com", "to": "a@example.com",
+      "subject": "Batch 1", "text": "hi" },
+    { "from": "you@yourdomain.com", "to": "b@example.com",
+      "subject": "Batch 2", "html": "<p>hi</p>" }
+  ] }
+
+// 3. Scheduled send — Resend accepts a `scheduled_at` ISO-8601 field in the body.
+//    Attachments are passed as an `attachments` array (base64 `content` + filename);
+//    the body is passed through verbatim, so the agent controls the full JSON shape.
+{ "service": "resend", "method": "POST", "path": "/emails",
+  "body": {
+    "from": "you@yourdomain.com", "to": "user@example.com",
+    "subject": "Report", "html": "<b>See attached</b>",
+    "scheduled_at": "2025-01-31T10:00:00Z",
+    "attachments": [
+      { "filename": "report.pdf", "content": "<base64-encoded-bytes>" }
+    ]
+  } }
+
+// 4. List domains (admin key) — discover a domain id for verify/delete
+{ "service": "resend_admin", "method": "GET", "path": "/domains" }
+
+// 5. Create + verify a domain (admin key)
+{ "service": "resend_admin", "method": "POST", "path": "/domains",
+  "body": { "name": "yourdomain.com", "region": "us-east-1" } }
+
+// 5b. Trigger verification once the DNS records Resend returns are in place
+{ "service": "resend_admin", "method": "POST", "path": "/domains/{domain_id}/verify" }
+
+// 6. Retrieve (GET) and remove (DELETE) a domain
+{ "service": "resend_admin", "method": "GET",    "path": "/domains/{domain_id}" }
+{ "service": "resend_admin", "method": "DELETE", "path": "/domains/{domain_id}" }
+
+// 7. API keys (admin key) — list existing keys, then create a new scoped one
+{ "service": "resend_admin", "method": "GET",  "path": "/api-keys" }
+{ "service": "resend_admin", "method": "POST", "path": "/api-keys",
+  "body": { "name": "ci-send-only", "permission": "sending_access",
+            "domain_id": "{domain_id}" } }
+
+// 8. Audiences + contacts (admin key)
+{ "service": "resend_admin", "method": "GET",  "path": "/audiences" }
+{ "service": "resend_admin", "method": "POST", "path": "/audiences/{audience_id}/contacts",
+  "body": { "email": "subscriber@example.com", "first_name": "Jane",
+            "unsubscribed": false } }
+```
+
+Notes:
+- The `X-Idempotency-Key` header (recipe 1) is passed through to Resend so a
+  retried send will not duplicate the email.
+- Replace `{domain_id}` / `{audience_id}` with ids discovered via the list
+  recipes above.
+- On a non-2xx, the error body is still returned to the agent (flagged
+  `isError`) for debugging. See the
+  [Resend REST API reference](https://resend.rest/) and the
+  [Create API key docs](https://resend.com/docs/api-reference/api-keys/create-api-key).
 
 ### The Secret Vault (Encrypted at Rest by Default, Selectable Backend)
 The local secret vault holds the API keys and tokens that the MCP server injects

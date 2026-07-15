@@ -1,0 +1,6 @@
+- [ ] Define `resend` and `resend_admin` service entries in `services.yaml` mapped to secret keys — verify: Configuration loads without schema validation errors.
+- [ ] Implement `Bearer` auth injection in `call_service_api` handler based on the requested service alias — verify: Sent requests contain the correct `Authorization: Bearer <token>` header.
+- [ ] Map endpoint URL patterns to the appropriate service (e.g., `/emails` → `resend`, `/domains` → `resend_admin`) — verify: Access denied on `POST /domains` when using `resend` key.
+- [ ] Enable passthrough support for `X-Idempotency-Key` headers and multipart form data for `attachments` — verify: Successful receipt of email with attachment.
+- [ ] Create an integration test suite targeting `POST /emails`, `POST /api-keys`, and `GET /domains` — verify: All CRUD operations succeed with valid scoped tokens.
+- [ ] Document Resend configuration, two-key strategy, and sample `call_service_api` recipes in `README.md` — verify: Documentation matches the implemented service aliases.

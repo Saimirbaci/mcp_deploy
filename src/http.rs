@@ -98,9 +98,10 @@ fn validate_path_allowed(service: &ServiceInfo, path: &str) -> Result<()> {
         && !prefixes.is_empty()
     {
         let normalized = normalize_leading_slash(path);
-        let ok = prefixes
-            .iter()
-            .any(|p| normalized.starts_with(&normalize_leading_slash(p)));
+        let ok = prefixes.iter().any(|p| {
+            let prefix = normalize_leading_slash(p);
+            normalized == prefix || normalized.starts_with(&format!("{}/", prefix))
+        });
         if !ok {
             return Err(anyhow!(
                 "Request path '{}' is not within an allowed path prefix for this service",
@@ -165,6 +166,40 @@ fn query_pairs(query: Option<&serde_json::Value>) -> Vec<(String, String)> {
     pairs
 }
 
+/// Header names a caller is allowed to supply on a service call. This is an
+/// explicit allowlist (rather than passing anything through) so the agent can
+/// never override the injected `Authorization`/credential header or inject
+/// low-level transport headers (`Host`, `Content-Length`, …). Idempotency keys
+/// and Resend's `Idempotency-Key` are the main use case. Matching is
+/// case-insensitive.
+const ALLOWED_CALLER_HEADERS: &[&str] = &["x-idempotency-key", "idempotency-key"];
+
+/// Convert a caller-supplied JSON object of header overrides into (name,
+/// value) string pairs, restricted to the safe allowlist above. Non-string
+/// scalars are stringified; nested arrays/objects are skipped. The original
+/// header name casing from the caller is preserved on the wire.
+fn caller_headers(headers: Option<&serde_json::Value>) -> Vec<(String, String)> {
+    let mut pairs = Vec::new();
+    if let Some(serde_json::Value::Object(map)) = headers {
+        for (k, v) in map {
+            if !ALLOWED_CALLER_HEADERS
+                .iter()
+                .any(|allowed| allowed.eq_ignore_ascii_case(k))
+            {
+                continue;
+            }
+            let value = match v {
+                serde_json::Value::String(s) => s.clone(),
+                serde_json::Value::Null => continue,
+                other if other.is_array() || other.is_object() => continue,
+                other => other.to_string(),
+            };
+            pairs.push((k.clone(), value));
+        }
+    }
+    pairs
+}
+
 /// Resolve the default vault path (`$HOME/.remote_connections/mcp_secrets.json`).
 fn default_secrets_path() -> Result<String> {
     let home = std::env::var("HOME").context("Could not find HOME environment variable")?;
@@ -187,6 +222,7 @@ pub fn call_service(
     method: &str,
     path: &str,
     query: Option<&serde_json::Value>,
+    headers: Option<&serde_json::Value>,
     body: Option<&serde_json::Value>,
     config: &Config,
 ) -> Result<ServiceResponse> {
@@ -244,6 +280,12 @@ pub fn call_service(
     let caller_query = query_pairs(query);
     if !caller_query.is_empty() {
         request = request.query(&caller_query);
+    }
+
+    // Caller-supplied headers, restricted to a safe allowlist so the injected
+    // credential cannot be overridden (e.g. `X-Idempotency-Key` for Resend sends).
+    for (name, value) in caller_headers(headers) {
+        request = request.header(name.as_str(), value.as_str());
     }
 
     // Apply the credential per the configured auth scheme.
@@ -369,7 +411,7 @@ mod tests {
             services,
             secret_backend: crate::config::SecretBackend::default(),
         };
-        let err = call_service("ro", "DELETE", "/zones", None, None, &config).unwrap_err();
+        let err = call_service("ro", "DELETE", "/zones", None, None, None, &config).unwrap_err();
         assert!(err.to_string().contains("not permitted"));
     }
 
@@ -463,7 +505,7 @@ mod tests {
             secret_backend: crate::config::SecretBackend::default(),
         };
         let err =
-            call_service("cloudflare", "GET", "/accounts/abc", None, None, &config).unwrap_err();
+            call_service("cloudflare", "GET", "/accounts/abc", None, None, None, &config).unwrap_err();
         assert!(
             err.to_string()
                 .contains("not within an allowed path prefix")
@@ -482,7 +524,7 @@ mod tests {
             services,
             secret_backend: crate::config::SecretBackend::default(),
         };
-        let err = call_service("confined", "GET", "/user/tokens", None, None, &config).unwrap_err();
+        let err = call_service("confined", "GET", "/user/tokens", None, None, None, &config).unwrap_err();
         assert!(
             err.to_string()
                 .contains("not within an allowed path prefix")
@@ -592,7 +634,180 @@ mod tests {
             services: HashMap::new(),
             secret_backend: crate::config::SecretBackend::default(),
         };
-        let err = call_service("nope", "GET", "/", None, None, &config).unwrap_err();
+        let err = call_service("nope", "GET", "/", None, None, None, &config).unwrap_err();
         assert!(err.to_string().contains("not in the allowed services list"));
+    }
+
+    #[test]
+    fn caller_headers_filters_to_allowlist_and_stringifies_scalars() {
+        let input = serde_json::json!({
+            "X-Idempotency-Key": "send-123",
+            "Idempotency-Key": 456,
+            "Authorization": "Bearer attacker",
+            "X-Other": "nope",
+            "Nested": { "a": 1 }
+        });
+        let mut pairs = caller_headers(Some(&input));
+        pairs.sort();
+        assert_eq!(
+            pairs,
+            vec![
+                ("Idempotency-Key".to_string(), "456".to_string()),
+                ("X-Idempotency-Key".to_string(), "send-123".to_string()),
+            ]
+        );
+    }
+
+    /// Resend sending-only service: bearer auth, GET+POST only, confined to /emails.
+    fn resend_send_service() -> ServiceInfo {
+        ServiceInfo {
+            base_url: "https://api.resend.com".to_string(),
+            auth: AuthScheme::Bearer,
+            secret_name: "ResendSendKey".to_string(),
+            extra: None,
+            allowed_methods: Some(["GET", "POST"].into_iter().map(String::from).collect()),
+            allowed_path_prefixes: Some(["/emails"].into_iter().map(String::from).collect()),
+        }
+    }
+
+    /// Resend full-access (admin) service: bearer auth, full verb set, spans the
+    /// entire Resend management surface — domains, keys, audiences, broadcasts,
+    /// webhooks — in addition to sending.
+    fn resend_admin_service() -> ServiceInfo {
+        ServiceInfo {
+            base_url: "https://api.resend.com".to_string(),
+            auth: AuthScheme::Bearer,
+            secret_name: "ResendAdminKey".to_string(),
+            extra: None,
+            allowed_methods: Some(
+                ["GET", "POST", "PUT", "PATCH", "DELETE"]
+                    .into_iter()
+                    .map(String::from)
+                    .collect(),
+            ),
+            allowed_path_prefixes: Some(
+                ["/emails", "/domains", "/api-keys", "/audiences", "/broadcasts", "/webhooks"]
+                    .into_iter()
+                    .map(String::from)
+                    .collect(),
+            ),
+        }
+    }
+
+    #[test]
+    fn resend_send_service_confines_to_emails_and_rejects_admin_paths() {
+        let send = resend_send_service();
+
+        // Single send, batch send, (read-side) retrieval, and a trailing-slash
+        // variant all live under /emails and must be permitted.
+        for path in ["/emails", "/emails/", "/emails/batch"] {
+            assert!(
+                validate_path_allowed(&send, path).is_ok(),
+                "expected {path} to be allowed for the sending-only key"
+            );
+        }
+
+        // Administrative surfaces must be refused when using the sending-only key.
+        for path in [
+            "/domains",
+            "/domains/abc/verify",
+            "/api-keys",
+            "/audiences",
+            "/audiences/abc/contacts",
+            "/broadcasts",
+            "/webhooks",
+            // Paths that share a prefix but differ at a non-'/' boundary must
+            // also be refused (e.g. `/emails2` must not match the `/emails` prefix).
+            "/emails2",
+            "/domains2",
+            "/emails-admin",
+        ] {
+            assert!(
+                validate_path_allowed(&send, path).is_err(),
+                "expected {path} to be DENIED for the sending-only key"
+            );
+        }
+
+        // Only GET/POST are permitted for the sending-only alias.
+        assert!(validate_method_allowed(&send, "get").is_ok());
+        assert!(validate_method_allowed(&send, "POST").is_ok());
+        assert!(validate_method_allowed(&send, "DELETE").is_err());
+        assert!(validate_method_allowed(&send, "PUT").is_err());
+    }
+
+    #[test]
+    fn resend_admin_service_covers_full_lifecycle_surface() {
+        let admin = resend_admin_service();
+
+        // The full management lifecycle lives under these prefixes.
+        for path in [
+            "/emails",
+            "/emails/batch",
+            "/domains",
+            "/domains/abc",
+            "/domains/abc/verify",
+            "/api-keys",
+            "/api-keys/key_123",
+            "/audiences",
+            "/audiences/aud_123",
+            "/audiences/aud_123/contacts",
+            "/broadcasts",
+            "/broadcasts/bc_123",
+            "/webhooks",
+            "/webhooks/wh_123",
+        ] {
+            assert!(
+                validate_path_allowed(&admin, path).is_ok(),
+                "expected {path} to be allowed for the admin key"
+            );
+        }
+
+        // Anything outside the allowlisted surface is refused fail-closed.
+        assert!(validate_path_allowed(&admin, "/accounts").is_err());
+        assert!(validate_path_allowed(&admin, "/domains/../../accounts").is_err());
+
+        // The full set of verbs is permitted (case-insensitive).
+        for method in ["GET", "post", "Put", "PATCH", "delete"] {
+            assert!(
+                validate_method_allowed(&admin, method).is_ok(),
+                "expected {method} to be allowed for the admin key"
+            );
+        }
+    }
+
+    #[test]
+    fn call_service_refuses_admin_endpoint_with_send_key_before_vault_access() {
+        // A request to create a domain via POST /domains must be refused by the
+        // sending-only service without ever touching the keychain or network:
+        // path validation happens before secret load.
+        let mut services = HashMap::new();
+        services.insert("resend".to_string(), resend_send_service());
+        let config = Config {
+            servers: HashMap::new(),
+            services,
+            secret_backend: crate::config::SecretBackend::default(),
+        };
+        let err = call_service(
+            "resend",
+            "POST",
+            "/domains",
+            None,
+            None,
+            None,
+            &config,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("not within an allowed path prefix"),
+            "expected path-prefix rejection, got: {err}"
+        );
+    }
+
+    #[test]
+    fn resend_send_service_rejects_destructive_verb_for_emails() {
+        // Even on the allowed /emails prefix, the sending-only alias must not
+        // permit DELETE — validation fails closed on the verb before any I/O.
+        let send = resend_send_service();
+        assert!(validate_method_allowed(&send, "DELETE").is_err());
     }
 }
