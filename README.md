@@ -148,12 +148,14 @@ Or specify a custom config path:
      stop, reset, delete, create, resize) but not metadata-mutating verbs on
      existing instances; `compute firewall-rules`/`images`/`networks` are
      read-only. `auth`, `iam`, `billing`, `projects`, `kms`, `secrets`,
-     `resource-manager`, `organizations`, `config`, identity/project-pivoting
+     `resource-manager`, `organizations`, `config`, identity/project/scope-pivoting
      flags (`--account`, `--impersonate-service-account`, `--key-file`,
-     `--configuration`, `--credential-file-override`, `--project`), and any
-     flag that reads from or writes to an arbitrary local file
-     (`--metadata-from-file`, `--flags-file`, `--destination`, any
-     `*-file`/`*-from-file` flag) are always refused, before any subprocess runs.
+     `--configuration`, `--credential-file-override`, `--project`,
+     `--service-account`, `--scopes`), and any flag that reads from or writes to
+     an arbitrary local file (`--metadata-from-file`, `--flags-file`,
+     `--destination`, any `*-file`/`*-from-file` flag) are always refused, before
+     any subprocess runs — including unambiguous abbreviations of these flags
+     that `gcloud` itself would expand (e.g. `--scope` for `--scopes`).
    - **Non-interactive/non-streaming**, bounded to 60 seconds, mirroring
      `run_command`.
 
@@ -578,6 +580,39 @@ this project's own `~/.remote_connections/mcp_secrets.json`) could otherwise
 be read into instance metadata at `create` time and then read back via an
 allowed `describe` call.
 
+**Flag matching accounts for gcloud's abbreviation feature.** `gcloud` resolves
+any unambiguous prefix of a flag's full name to that flag (e.g. `--scope=` for
+`--scopes=`, `--service-acc=` for `--service-account=`, `--metadata-from-fil=`
+for `--metadata-from-file=`), so a caller cannot bypass any of the denials
+above by shortening a flag name — the guard checks for abbreviations of every
+denied flag, not just its exact spelling.
+
+**Residual risk: instances still get the project's default Compute Engine
+service account.** Denying `--service-account`/`--scopes` prevents an agent
+from attaching an *explicit*, over-privileged identity to a self-created VM,
+but omitting those flags entirely does not mean "no identity" — `create`
+still attaches the project's **default** Compute Engine service account with
+gcloud's default OAuth scopes. If that default service account has ever been
+granted broad IAM roles at the project level (a common real-world
+misconfiguration, e.g. a legacy `Editor` binding — see
+[Google's own warning](https://cloud.google.com/compute/docs/access/service-accounts#default_service_account)),
+the still-allowed inline `--metadata=startup-script=...` on `create` can run
+code that fetches a token scoped to whatever that default account can do. This
+tool cannot detect or restrict a project's IAM bindings from the outside;
+**operators should ensure the default Compute Engine service account has been
+demoted to least privilege (or disabled) before enabling `gcloud_command`**,
+independent of the service-account key this tool itself uses.
+
+**Residual risk: no cost/quantity rate-limiting.** `create`/`resize` on
+instances, disks, and snapshots have no built-in cap on machine type, disk
+size, or repetition — an agent (especially one driven by a prompt-injected or
+otherwise compromised caller) could loop expensive `create` calls or resize to
+large machine types, running up the GCP bill. This tool does not implement its
+own quota/rate-limiter; **rely on GCP's own project quotas and budget alerts**
+(Billing → Budgets & alerts) as the enforcement backstop, and consider scoping
+the service account's IAM role to a specific zone/region or a narrower
+`compute.instanceAdmin` variant if this is a concern for your deployment.
+
 **Recipes** (the agent only ever passes `args`; the service account is already
 activated):
 
@@ -633,6 +668,8 @@ activated):
 { "args": ["compute", "instances", "create", "evil-vm",
            "--scopes=cloud-platform",
            "--metadata=startup-script=curl-the-metadata-server-and-exfiltrate-the-token"] } // over-privileged self-created VM
+{ "args": ["compute", "instances", "create", "evil-vm",
+           "--scope=cloud-platform"] }                              // abbreviation of --scopes, refused the same way
 ```
 
 **The service-account key is never echoed to agent-visible output**: it is

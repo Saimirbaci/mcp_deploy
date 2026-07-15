@@ -306,9 +306,13 @@ fn main() -> Result<()> {
             gcloud_guard::validate_gcloud_args(&args)?;
             gcloud::activate_service_account(gcp, &cfg)?;
             let output = gcloud::run_gcloud(&args, gcp)?;
-            print!("{}", scrubber::scrub_output(&output.stdout, &[]));
+            // Scrub with both layers, matching the MCP gcloud_command handler: the
+            // shared vault's literal secret values (the GCP key and any
+            // service-api credentials) plus the format-based patterns.
+            let known_secrets = config::known_shared_secret_values(&cfg);
+            print!("{}", scrubber::scrub_output(&output.stdout, &known_secrets));
             if !output.stderr.is_empty() {
-                eprint!("{}", scrubber::scrub_output(&output.stderr, &[]));
+                eprint!("{}", scrubber::scrub_output(&output.stderr, &known_secrets));
             }
             if output.exit_code != 0 {
                 std::process::exit(output.exit_code);

@@ -21,11 +21,13 @@ const DENY_FIRST_TOKENS: &[&str] = &[
 /// caller-chosen local write destination such as `compute instances export
 /// --destination=<path>`, or an over-privileged identity attached to a
 /// brand-new instance). Denied anywhere in argv regardless of subcommand.
-/// Matched against the flag *name* (the portion of the argument before `=`),
-/// so `--account=x` is caught without falsely flagging unrelated flags.
-/// `--project` is caller-supplied-only forbidden here; the server injects
-/// its own `--project=<configured>` in `gcloud::build_gcloud_argv` after
-/// this validation passes.
+/// Matched against the flag *name* (the portion of the argument before `=`)
+/// via [`matches_or_abbreviates`], so both the exact spelling (`--account=x`)
+/// AND any unambiguous prefix abbreviation `gcloud` itself would expand to it
+/// (`--acc=x`) are caught — see that function's doc for why prefix matching
+/// is safe to apply fail-closed. `--project` is caller-supplied-only
+/// forbidden here; the server injects its own `--project=<configured>` in
+/// `gcloud::build_gcloud_argv` after this validation passes.
 ///
 /// `--service-account` and `--scopes` are denied on `compute instances
 /// create` (and anywhere else) because they let the caller attach an
@@ -48,6 +50,60 @@ const DENY_FLAGS: &[&str] = &[
     "--service-account",
     "--scopes",
 ];
+
+/// Full flag names, known to load content from an arbitrary local file, used
+/// as abbreviation-prefix-matching targets in [`is_local_file_flag`] (via
+/// [`matches_or_abbreviates`]) so a truncated form gcloud would still expand
+/// to one of these (e.g. `--metadata-from-fil` -> `--metadata-from-file`) is
+/// caught even though it doesn't itself end in "-file"/contain "-from-file".
+/// Illustrative, not exhaustive — see [`is_local_file_flag`]'s doc for the
+/// general substring heuristic that remains the catch-all for full
+/// (non-abbreviated) flag names not enumerated here.
+const KNOWN_LOCAL_FILE_FLAGS: &[&str] = &[
+    "--metadata-from-file",
+    "--flags-file",
+    "--source-instance-template-file",
+    "--config-from-file",
+    "--certificate-file",
+    "--private-key-file",
+    "--csek-key-file",
+];
+
+/// Flags that are genuine, standalone gcloud flags in their own right and
+/// must never be treated as an abbreviation of anything, even though they
+/// happen to be a literal text prefix of a flag in [`KNOWN_LOCAL_FILE_FLAGS`]
+/// or [`DENY_FLAGS`]. The concrete case: `--metadata` (allowed — see
+/// `test_allows_inline_metadata_on_create_but_not_mutation_verbs`) is a
+/// complete, distinct flag from `--metadata-from-file`, sharing only a
+/// naming-convention stem gcloud itself uses for its `--from-file` variants.
+/// Since `--metadata` exactly matches a real flag, gcloud parses it as
+/// itself — never as an ambiguous abbreviation of the longer name — so it
+/// must not be denied. A strictly *shorter* abbreviation of `--metadata`
+/// (e.g. `--meta`) is NOT exempted here: that string is genuinely ambiguous
+/// between `--metadata` and `--metadata-from-file` in real gcloud (which
+/// would itself refuse to run rather than pick one), so denying it
+/// preemptively is still safe and correct.
+const KNOWN_SAFE_EXACT_FLAGS: &[&str] = &["--metadata"];
+
+/// Returns whether `name` (a `--`-prefixed flag argument, already lowercased)
+/// exactly matches, or is an unambiguous-abbreviation prefix of, any flag in
+/// `full_names`.
+///
+/// `gcloud` resolves any prefix of a flag's full name to that flag as long as
+/// it is unambiguous among the flags available on the invoked command, so
+/// exact-string denylist matching alone can be bypassed by a caller passing a
+/// shortened form (e.g. `--scope=cloud-platform` for `--scopes`,
+/// `--service-acc=...` for `--service-account`). Denying on prefix match is
+/// safe to apply fail-closed: if the abbreviation were ambiguous with some
+/// *other*, unrelated flag, gcloud itself would refuse to run rather than
+/// silently pick one — so this can never reject a call that gcloud would
+/// have accepted as a genuinely different flag, only ones that would have
+/// resolved to (or ambiguously included) a flag we deny anyway. Requires at
+/// least one character after `--` so the bare separator `--` itself (used by
+/// some CLIs to end flag parsing) is never treated as a match.
+fn matches_or_abbreviates(name: &str, full_names: &[&str]) -> bool {
+    name.len() > 2 && full_names.iter().any(|full| full.starts_with(name))
+}
 
 /// Per-resource-group verb allow-lists (the third argv token). The resource
 /// group alone is not a sufficient boundary: several verbs available under
@@ -114,26 +170,45 @@ fn flag_name(arg: &str) -> &str {
     arg.split('=').next().unwrap_or(arg)
 }
 
-/// Returns whether `name` (already lowercased, flag-name-only, and confirmed
-/// by the caller to actually be a `--`-prefixed flag — see
-/// [`validate_gcloud_args`]) loads content from an arbitrary local file path.
-/// gcloud exposes many such flags (`--metadata-from-file`, `--flags-file`,
-/// per-resource `*-from-file` variants, …) and enumerating every one by name
-/// would always be incomplete, so the whole class is denied: any of them can
-/// be used to read a local secret file's bytes into a resource (e.g.
-/// instance metadata) that a subsequent allowed `describe`/`list` call then
-/// echoes back through the (pattern-only-scrubbed) tool result, defeating
-/// the "secrets are never exposed to the agent" model the same way reading
-/// `~/.ssh/id_rsa` would on the SSH path.
+/// Returns whether `name` (already lowercased, flag-name-only, and required
+/// by the caller to actually be a `--`-prefixed flag — enforced here via a
+/// debug assertion, since [`validate_gcloud_args`] is the only caller and
+/// must gate on that precondition before invoking this function) loads
+/// content from an arbitrary local file path. gcloud exposes many such flags
+/// (`--metadata-from-file`, `--flags-file`, per-resource `*-from-file`
+/// variants, …) and enumerating every one by name would always be
+/// incomplete, so the whole class is denied: any of them can be used to read
+/// a local secret file's bytes into a resource (e.g. instance metadata) that
+/// a subsequent allowed `describe`/`list` call then echoes back through the
+/// (pattern-only-scrubbed) tool result, defeating the "secrets are never
+/// exposed to the agent" model the same way reading `~/.ssh/id_rsa` would on
+/// the SSH path.
 ///
-/// This is a name-pattern heuristic backstop, not an exhaustive enumeration:
-/// it catches every flag observed in gcloud's Compute Engine surface as of
-/// this writing, but a future flag that loads a local file without matching
-/// either substring (e.g. a hypothetical `--startup-script-uri`-style alias
-/// that doesn't say "file") would silently slip through. Extend this
-/// function (or add an explicit `DENY_FLAGS` entry) if one is found.
+/// Two layers: the substring heuristic below catches any *full* (i.e.
+/// non-abbreviated) flag name that says "file", and
+/// [`matches_or_abbreviates`] against [`KNOWN_LOCAL_FILE_FLAGS`] additionally
+/// catches truncated forms of those specific known flags that gcloud's
+/// flag-prefix abbreviation would still expand to them (e.g.
+/// `--metadata-from-fil`). Neither layer is an exhaustive enumeration of
+/// gcloud's entire flag surface: a future flag that loads a local file
+/// without matching either substring (e.g. a hypothetical
+/// `--startup-script-uri`-style alias that doesn't say "file"), or an
+/// abbreviation of a local-file flag not yet added to
+/// `KNOWN_LOCAL_FILE_FLAGS`, would silently slip through. Extend this
+/// function, `KNOWN_LOCAL_FILE_FLAGS`, or `DENY_FLAGS` if one is found; treat
+/// this as needing periodic re-audit as gcloud's Compute Engine flag surface
+/// evolves.
 fn is_local_file_flag(name: &str) -> bool {
-    name.ends_with("-file") || name.contains("-from-file")
+    debug_assert!(
+        name.starts_with("--"),
+        "is_local_file_flag must only be called with a --prefixed flag name"
+    );
+    if KNOWN_SAFE_EXACT_FLAGS.contains(&name) {
+        return false;
+    }
+    name.ends_with("-file")
+        || name.contains("-from-file")
+        || matches_or_abbreviates(name, KNOWN_LOCAL_FILE_FLAGS)
 }
 
 /// Validates a `gcloud` argv before it is executed locally.
@@ -148,7 +223,12 @@ fn is_local_file_flag(name: &str) -> bool {
 ///    `--project`, `--service-account`, `--scopes`, etc.), and any flag that
 ///    reads from or writes to an arbitrary local file path
 ///    (`--metadata-from-file`, `--flags-file`, `--destination`, …) —
-///    regardless of the allow-list.
+///    regardless of the allow-list. Flag matching is NOT plain exact-string
+///    comparison: `gcloud` resolves any unambiguous prefix abbreviation of a
+///    flag's full name (e.g. `--scope=` for `--scopes=`, `--service-acc=` for
+///    `--service-account=`) to that flag, so [`matches_or_abbreviates`] is
+///    used instead of a bare equality/`.contains()` check — see its doc for
+///    why prefix matching is safe to apply fail-closed.
 /// 2. A fail-closed allow-list on the resource group (first two tokens):
 ///    only `compute instances|disks|firewall-rules|snapshots|images|networks`.
 /// 3. A fail-closed allow-list on the *verb* (third token) within that
@@ -185,11 +265,11 @@ pub fn validate_gcloud_args(args: &[String]) -> Result<()> {
             continue;
         }
         let name = flag_name(&lowered);
-        if DENY_FLAGS.contains(&name) {
+        if matches_or_abbreviates(name, DENY_FLAGS) {
             return Err(anyhow!(
-                "Security Error: the '{}' flag is not permitted because it can \
-                 pivot off the pinned service-account identity, project, or an \
-                 over-privileged OAuth scope.",
+                "Security Error: the '{}' flag is not permitted (exactly or as an \
+                 abbreviation of a denied flag) because it can pivot off the pinned \
+                 service-account identity, project, or an over-privileged OAuth scope.",
                 name
             ));
         }
@@ -435,6 +515,161 @@ mod tests {
                 "--scopes=cloud-platform"
             ]))
             .is_err()
+        );
+    }
+
+    #[test]
+    fn test_denies_unambiguous_flag_abbreviations_of_denied_flags() {
+        // gcloud resolves any unambiguous prefix of a flag's full name to
+        // that flag, so exact-string denylist matching alone is bypassable
+        // by a shortened form. Every DENY_FLAGS entry must also be caught
+        // via a truncated abbreviation.
+        assert!(
+            validate_gcloud_args(&args(&[
+                "compute",
+                "instances",
+                "create",
+                "evil-vm",
+                "--scope=cloud-platform"
+            ]))
+            .is_err(),
+            "--scope must be denied as an abbreviation of --scopes"
+        );
+        assert!(
+            validate_gcloud_args(&args(&[
+                "compute",
+                "instances",
+                "create",
+                "evil-vm",
+                "--service-acc=attacker@x.iam.gserviceaccount.com"
+            ]))
+            .is_err(),
+            "--service-acc must be denied as an abbreviation of --service-account"
+        );
+        assert!(
+            validate_gcloud_args(&args(&[
+                "compute",
+                "instances",
+                "list",
+                "--acc=other@x.iam.gserviceaccount.com"
+            ]))
+            .is_err(),
+            "--acc must be denied as an abbreviation of --account"
+        );
+        assert!(
+            validate_gcloud_args(&args(&["compute", "instances", "list", "--projec=other"]))
+                .is_err(),
+            "--projec must be denied as an abbreviation of --project"
+        );
+        assert!(
+            validate_gcloud_args(&args(&[
+                "compute",
+                "instances",
+                "list",
+                "--key-fil=/tmp/key.json"
+            ]))
+            .is_err(),
+            "--key-fil must be denied as an abbreviation of --key-file"
+        );
+        assert!(
+            validate_gcloud_args(&args(&[
+                "compute",
+                "instances",
+                "export",
+                "my-vm",
+                "--destinatio=/tmp/out.yaml"
+            ]))
+            .is_err(),
+            "--destinatio must be denied as an abbreviation of --destination"
+        );
+        assert!(
+            validate_gcloud_args(&args(&[
+                "compute",
+                "instances",
+                "list",
+                "--configuratio=other"
+            ]))
+            .is_err(),
+            "--configuratio must be denied as an abbreviation of --configuration"
+        );
+        assert!(
+            validate_gcloud_args(&args(&[
+                "compute",
+                "instances",
+                "list",
+                "--impersonate-service-accoun=x@y.iam.gserviceaccount.com"
+            ]))
+            .is_err(),
+            "--impersonate-service-accoun must be denied as an abbreviation"
+        );
+        assert!(
+            validate_gcloud_args(&args(&[
+                "compute",
+                "instances",
+                "list",
+                "--credential-file-overrid=/tmp/x"
+            ]))
+            .is_err(),
+            "--credential-file-overrid must be denied as an abbreviation"
+        );
+    }
+
+    #[test]
+    fn test_denies_abbreviated_local_file_flag() {
+        // Truncated form of a known local-file-loading flag that gcloud
+        // would still expand unambiguously — the primary Major-severity gap
+        // this fix closes.
+        assert!(
+            validate_gcloud_args(&args(&[
+                "compute",
+                "instances",
+                "create",
+                "new-vm",
+                "--metadata-from-fil=leak=/Users/someone/.remote_connections/mcp_secrets.json"
+            ]))
+            .is_err()
+        );
+        assert!(
+            validate_gcloud_args(&args(&[
+                "compute",
+                "instances",
+                "list",
+                "--flags-fil=/tmp/x"
+            ]))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn test_flag_abbreviation_check_does_not_flag_unrelated_allowed_flags() {
+        // The exact, complete --metadata flag (distinct from
+        // --metadata-from-file) must remain allowed: gcloud only resolves an
+        // abbreviation when the supplied token does not itself already name
+        // a real flag, so a caller passing the genuine, complete --metadata
+        // flag is never routed through abbreviation expansion toward
+        // --metadata-from-file, and this guard must not conflate the two.
+        assert!(
+            validate_gcloud_args(&args(&[
+                "compute",
+                "instances",
+                "create",
+                "new-vm",
+                "--metadata=startup-script=echo hi"
+            ]))
+            .is_ok()
+        );
+        // Common, unrelated flags used across the recipes/README must not be
+        // caught by the new prefix-matching logic.
+        assert!(
+            validate_gcloud_args(&args(&[
+                "compute",
+                "instances",
+                "create",
+                "new-vm",
+                "--machine-type=e2-micro",
+                "--zone=us-central1-a"
+            ]))
+            .is_ok()
         );
     }
 
