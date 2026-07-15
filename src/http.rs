@@ -810,4 +810,83 @@ mod tests {
         let send = resend_send_service();
         assert!(validate_method_allowed(&send, "DELETE").is_err());
     }
+
+    /// OpenRouter provisioning service: bearer auth, GET/POST/PATCH/DELETE,
+    /// confined to /keys, /credits, /models — never the completions/generation
+    /// surface, which the provisioning key cannot call anyway but which the
+    /// allowlist must independently refuse as defense-in-depth.
+    fn openrouter_service() -> ServiceInfo {
+        service_with_guards(
+            Some(vec!["GET", "POST", "PATCH", "DELETE"]),
+            Some(vec!["/keys", "/credits", "/models"]),
+        )
+    }
+
+    #[test]
+    fn openrouter_guards_allow_provisioning_surface_and_reject_completions() {
+        let or = openrouter_service();
+
+        // Key management, credits, and model catalog paths must be permitted.
+        for path in ["/keys", "/keys/", "/keys/abc123hash", "/credits", "/models"] {
+            assert!(
+                validate_path_allowed(&or, path).is_ok(),
+                "expected {path} to be allowed"
+            );
+        }
+
+        // The completions/generation surface is out of scope for the
+        // provisioning key and must be refused fail-closed, along with
+        // traversal and out-of-scope paths.
+        for path in [
+            "/chat/completions",
+            "/completions",
+            "/generation",
+            "/keys/../../etc",
+            "/keys2",
+        ] {
+            assert!(
+                validate_path_allowed(&or, path).is_err(),
+                "expected {path} to be DENIED"
+            );
+        }
+
+        // Only GET/POST/PATCH/DELETE are permitted; PUT is not part of the
+        // provisioning API and must be refused.
+        for method in ["GET", "post", "Patch", "delete"] {
+            assert!(
+                validate_method_allowed(&or, method).is_ok(),
+                "expected {method} to be allowed"
+            );
+        }
+        assert!(validate_method_allowed(&or, "PUT").is_err());
+    }
+
+    #[test]
+    fn call_service_rejects_openrouter_completions_path_before_vault_access() {
+        // A request to the completions endpoint must be refused before any
+        // keychain access or network call — the provisioning key is scoped
+        // away from the inference surface entirely.
+        let mut services = HashMap::new();
+        services.insert("openrouter".to_string(), openrouter_service());
+        let config = Config {
+            servers: HashMap::new(),
+            services,
+            secret_backend: crate::config::SecretBackend::default(),
+        };
+        let err = call_service(
+            "openrouter",
+            "POST",
+            "/chat/completions",
+            None,
+            None,
+            None,
+            &config,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("not within an allowed path prefix"),
+            "expected path-prefix rejection, got: {err}"
+        );
+    }
 }

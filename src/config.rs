@@ -673,6 +673,71 @@ mod tests {
     }
 
     #[test]
+    fn test_openrouter_entry_parses_with_method_and_path_allowlists() {
+        // The shipped openrouter service entry carries a bearer-auth
+        // provisioning key, confined to the /keys, /credits, and /models
+        // surface. Parsing must preserve both allowlists so the http guards
+        // can enforce them.
+        let json = r#"{
+            "servers": {},
+            "services": {
+                "openrouter": {
+                    "base_url": "https://openrouter.ai/api/v1",
+                    "auth": "bearer",
+                    "secret_name": "OpenRouterProvKey",
+                    "allowed_methods": ["GET", "POST", "PATCH", "DELETE"],
+                    "allowed_path_prefixes": ["/keys", "/credits", "/models"]
+                }
+            }
+        }"#;
+        let config: Config = serde_json::from_str(json).unwrap();
+        let or = config.get_service("openrouter").unwrap();
+
+        assert!(matches!(or.auth, AuthScheme::Bearer));
+        assert_eq!(or.secret_name, "OpenRouterProvKey");
+        assert_eq!(
+            or.allowed_methods.as_deref().unwrap(),
+            ["GET", "POST", "PATCH", "DELETE"]
+        );
+        assert_eq!(
+            or.allowed_path_prefixes.as_deref().unwrap(),
+            ["/keys", "/credits", "/models"]
+        );
+    }
+
+    #[test]
+    fn test_sample_config_openrouter_service_loads() {
+        // The shipped sample_config.json must define the openrouter service
+        // alongside cloudflare/resend/resend_admin, and allowed_services()
+        // must expose only (name, base_url) — never the secret name.
+        let manifest_dir = env!("CARGO_MANIFEST_DIR");
+        let sample_path = format!("{manifest_dir}/sample_config.json");
+        let raw =
+            fs::read_to_string(&sample_path).expect("sample_config.json must ship with the crate");
+
+        let config: Config =
+            serde_json::from_str(&raw).expect("sample_config.json must parse cleanly");
+
+        let openrouter = config
+            .services
+            .get("openrouter")
+            .expect("'openrouter' service must be defined");
+        assert_eq!(openrouter.base_url, "https://openrouter.ai/api/v1");
+        assert!(matches!(openrouter.auth, AuthScheme::Bearer));
+        assert_eq!(openrouter.secret_name, "OpenRouterProvKey");
+
+        let allowed = config.allowed_services();
+        assert!(
+            allowed.iter().any(|(name, base_url)| name == "openrouter"
+                && base_url == "https://openrouter.ai/api/v1")
+        );
+        assert!(allowed.iter().any(|(name, _)| name == "cloudflare"));
+        assert!(allowed.iter().any(|(name, _)| name == "resend"));
+        assert!(allowed.iter().any(|(name, _)| name == "resend_admin"));
+        assert!(!format!("{:?}", allowed).contains("OpenRouterProvKey"));
+    }
+
+    #[test]
     fn test_get_and_list_names_operate_on_loaded_data() {
         let mut data = HashMap::new();
         data.insert("ApiKey".to_string(), "secret-value".to_string());

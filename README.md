@@ -389,6 +389,79 @@ Notes:
   [Resend REST API reference](https://resend.rest/) and the
   [Create API key docs](https://resend.com/docs/api-reference/api-keys/create-api-key).
 
+#### OpenRouter (API key provisioning, spend limits, usage)
+
+The shipped `openrouter` service entry (see `sample_config.json`) lets the
+agent manage OpenRouter runtime API keys — creating them with spend limits,
+disabling/deleting them, and checking credit balance — without ever seeing the
+provisioning key:
+
+```json
+"openrouter": {
+  "base_url": "https://openrouter.ai/api/v1",
+  "auth": "bearer",
+  "secret_name": "OpenRouterProvKey",
+  "allowed_methods": ["GET", "POST", "PATCH", "DELETE"],
+  "allowed_path_prefixes": ["/keys", "/credits", "/models"]
+}
+```
+
+**Provisioning (Management) key.** Mint one in the OpenRouter dashboard at
+<https://openrouter.ai/settings/provisioning-keys>. This key manages other API
+keys (`/keys`) and reads account credits (`/credits`) — **it cannot itself call
+completions/generation**, and the `allowed_path_prefixes` allowlist above
+independently enforces that boundary regardless of what the key is scoped to
+upstream.
+
+Store it in the local vault under the name `OpenRouterProvKey` (the value is
+read via a no-echo prompt or piped from stdin — never passed as an argument):
+
+```bash
+mcp_deploy secret add OpenRouterProvKey
+mcp_deploy secret list   # confirms the name only; the value is never printed
+```
+
+**Recipes** (the agent only ever names the service; the provisioning key is
+injected server-side and redacted out of every response):
+
+```jsonc
+// 1. List existing runtime keys
+{ "service": "openrouter", "method": "GET", "path": "/keys" }
+
+// 2. Create a per-project key with a monthly spend cap
+{ "service": "openrouter", "method": "POST", "path": "/keys",
+  "body": { "name": "project-x", "limit": 20,
+            "limit_reset": "monthly" } }
+
+// 3. Look up a single key by its hash
+{ "service": "openrouter", "method": "GET", "path": "/keys/{key_hash}" }
+
+// 4. Update a key — e.g. disable it or change its limit
+{ "service": "openrouter", "method": "PATCH", "path": "/keys/{key_hash}",
+  "body": { "disabled": true } }
+
+// 5. Delete a key
+{ "service": "openrouter", "method": "DELETE", "path": "/keys/{key_hash}" }
+
+// 6. Check credit balance/usage
+{ "service": "openrouter", "method": "GET", "path": "/credits" }
+
+// 7. List available models (convenience/catalog lookup)
+{ "service": "openrouter", "method": "GET", "path": "/models" }
+```
+
+Replace `{key_hash}` with a value discovered via recipe 1. On a non-2xx, the
+error body is still returned to the agent (flagged `isError`) for debugging.
+
+> **Billing top-up is NOT automatable.** Adding credits to your OpenRouter
+> account must be done manually in the dashboard
+> (<https://openrouter.ai/settings/credits>) — there is no API for it, and this
+> integration intentionally does not attempt to work around that. `/credits`
+> here is **read-only** usage/balance reporting.
+
+See the
+[Provisioning API Keys docs](https://openrouter.ai/docs/features/provisioning-api-keys).
+
 ### The Secret Vault (Encrypted at Rest by Default, Selectable Backend)
 The local secret vault holds the API keys and tokens that the MCP server injects
 into SSH `.env` deploys and outbound `call_service_api` requests. The agent only
