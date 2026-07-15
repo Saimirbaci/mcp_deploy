@@ -29,6 +29,8 @@ static PATTERNS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
         r"\bAIza[0-9A-Za-z_-]{35}\b",
         // Slack tokens.
         r"\bxox[baprs]-[0-9A-Za-z-]{10,}\b",
+        // OpenRouter provisioning/runtime API keys (e.g. sk-or-v1-<64 hex chars>).
+        r"\bsk-or-v1-[0-9a-fA-F]{32,}\b",
     ];
 
     sources
@@ -127,6 +129,22 @@ mod tests {
         let out = scrub_output("ghp_0123456789abcdefghijABCDEFGHIJ012345", &[]);
         assert!(out.contains(REDACTED));
         assert!(!out.contains("ghp_0123456789"));
+    }
+
+    #[test]
+    fn test_redacts_openrouter_key() {
+        let key = "sk-or-v1-1234567890abcdef1234567890abcdef1234567890abcdef1234567890ab";
+        let out = scrub_output(&format!("key: {}", key), &[]);
+        assert!(!out.contains(key));
+        assert!(out.contains(REDACTED));
+    }
+
+    #[test]
+    fn test_leaves_openrouter_near_miss_untouched() {
+        // A /models catalog response or doc text that mentions the "sk-or-"
+        // prefix without the full key shape must not be redacted.
+        let text = "provider prefix is sk-or- and model id is openrouter/auto";
+        assert_eq!(scrub_output(text, &[]), text);
     }
 
     #[test]
