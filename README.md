@@ -563,7 +563,7 @@ cannot be used to pivot beyond ordinary instance/disk lifecycle management:
 
 | Resource group | Allowed verbs | Why not more |
 |---|---|---|
-| `compute instances` | `list`, `describe`, `start`, `stop`, `reset`, `delete`, `create`, `set-machine-type` | `add-metadata`/`remove-metadata`/`update` are refused — they would let the agent inject an SSH key or startup-script into **any** existing instance in the project, bypassing the SSH IP/alias whitelist entirely. `export`/`import` are refused — they read/write an attacker-chosen local file path. |
+| `compute instances` | `list`, `describe`, `start`, `stop`, `reset`, `delete`, `create`, `set-machine-type` | `add-metadata`/`remove-metadata`/`update` are refused — they would let the agent inject an SSH key or startup-script into **any** existing instance in the project, bypassing the SSH IP/alias whitelist entirely. `export`/`import` are refused — they read/write an attacker-chosen local file path. A caller-supplied `--service-account`/`--scopes` is refused even on `create` — otherwise a self-created VM could be given a broader identity/OAuth scope (e.g. `--scopes=cloud-platform`) than the pinned key itself, and an inline `--metadata=startup-script=...` (still allowed, since setting a new instance's own metadata at creation time is normal provisioning) could exfiltrate that scoped token from the instance metadata server. |
 | `compute disks` | `list`, `describe`, `create`, `delete`, `resize` | — |
 | `compute firewall-rules` | `list`, `describe` (read-only) | `create`/`update`/`delete` are refused — they could expose any instance in the project to the public internet (e.g. `--allow=tcp:22 --source-ranges=0.0.0.0/0`). |
 | `compute snapshots` | `list`, `describe`, `create`, `delete` | — |
@@ -630,6 +630,9 @@ activated):
            "--allow=tcp:22", "--source-ranges=0.0.0.0/0"] }       // opens the project to the internet
 { "args": ["compute", "instances", "create", "new-vm",
            "--metadata-from-file=leak=/Users/you/.remote_connections/mcp_secrets.json"] } // local file exfiltration
+{ "args": ["compute", "instances", "create", "evil-vm",
+           "--scopes=cloud-platform",
+           "--metadata=startup-script=curl-the-metadata-server-and-exfiltrate-the-token"] } // over-privileged self-created VM
 ```
 
 **The service-account key is never echoed to agent-visible output**: it is
