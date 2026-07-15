@@ -132,6 +132,25 @@ Or specify a custom config path:
      returned to the agent as a normal status. This prevents an open redirect on
      an allow-listed host from forwarding the injected credential (header or
      query) to an attacker-controlled origin.
+9. **`gcloud_command`**: Runs a `gcloud` command locally against a pre-authenticated
+   GCP service account to manage Compute Engine resources (see the `gcp` config
+   block below).
+   - **Arguments**: `args` (array of strings — the gcloud subcommand and flags as
+     separate argv elements, e.g. `["compute", "instances", "list"]`; **not** a
+     single shell string, so shell operators like pipes or `&&` are never
+     interpreted).
+   - **Blind credential model**: The service-account JSON key lives only in the
+     local vault; the MCP server activates it once at startup into an isolated
+     `CLOUDSDK_CONFIG` directory and the key is never returned to the agent or
+     written to logs.
+   - **Scope**: only `compute instances`, `compute disks`, `compute firewall-rules`,
+     `compute snapshots`, `compute images`, and `compute networks` are permitted.
+     `auth`, `iam`, `billing`, `projects`, `kms`, `secrets`, `resource-manager`,
+     `organizations`, `config`, and identity-pivoting flags (`--account`,
+     `--impersonate-service-account`, `--key-file`, `--configuration`,
+     `--credential-file-override`) are always refused, before any subprocess runs.
+   - **Non-interactive/non-streaming**, bounded to 60 seconds, mirroring
+     `run_command`.
 
 ### HTTP Services (`call_service_api`)
 In addition to SSH targets, the config may define an optional `services` map of
@@ -461,6 +480,127 @@ error body is still returned to the agent (flagged `isError`) for debugging.
 
 See the
 [Provisioning API Keys docs](https://openrouter.ai/docs/features/provisioning-api-keys).
+
+### GCP (Compute Engine instance management via `gcloud_command`)
+
+Unlike the HTTP services above, GCP authenticates with a service-account **JSON
+key file**, not a bearer token — so instead of `call_service_api`, this server
+pre-authenticates a local `gcloud` CLI once at startup and exposes it through
+the `gcloud_command` tool. The key is loaded from the vault, briefly
+materialized to a `0600` temp file to activate an isolated `CLOUDSDK_CONFIG`
+directory, and deleted immediately afterward — it is never returned to the
+agent.
+
+**1. Create a least-privilege service account.**
+
+```bash
+gcloud iam service-accounts create mcp-deploy-compute \
+  --project=my-gcp-project \
+  --display-name="mcp-deploy Compute Engine access"
+
+# Grant only Compute Engine instance admin — avoid Owner/Editor.
+gcloud projects add-iam-policy-binding my-gcp-project \
+  --member="serviceAccount:mcp-deploy-compute@my-gcp-project.iam.gserviceaccount.com" \
+  --role="roles/compute.instanceAdmin.v1"
+```
+
+**2. Download its JSON key and store the key *contents* in the vault** (never
+on disk outside the temp file `gcloud_command` itself manages):
+
+```bash
+gcloud iam service-accounts keys create /tmp/mcp-deploy-key.json \
+  --iam-account=mcp-deploy-compute@my-gcp-project.iam.gserviceaccount.com
+
+# Store the JSON contents as a vault secret, then delete the temp file.
+cat /tmp/mcp-deploy-key.json | mcp_deploy secret add GcpServiceAccountKey
+rm /tmp/mcp-deploy-key.json
+```
+
+**3. Add a `gcp` block to `mcp_config.json`:**
+
+```json
+"gcp": {
+  "project_id": "my-gcp-project",
+  "default_zone": "us-central1-a",
+  "default_region": "us-central1",
+  "key_secret_name": "GcpServiceAccountKey",
+  "cloudsdk_config_dir": "/Users/yourname/.remote_connections/gcp/config"
+}
+```
+
+- `project_id` is pinned into every `gcloud` call (`--project`); it cannot be
+  overridden by the agent (`config`/`projects` subcommands and `--account` are
+  always refused).
+- `default_zone` / `default_region` are injected automatically for zonal
+  resources (`compute instances`, `compute disks`) when the caller's `args`
+  don't already specify one.
+- `key_secret_name` is a reference into the local vault — the raw key JSON
+  never appears in the config file.
+- `cloudsdk_config_dir` (optional) isolates gcloud's own credential store from
+  any other gcloud installation on the host; defaults to
+  `$HOME/.remote_connections/gcp/config`.
+- At startup, the server checks `gcloud` is on `PATH` and activates the
+  service account once. A missing binary or bad key logs a clear error to
+  `stderr` without crashing the server — other tools (SSH, HTTP) keep working;
+  `gcloud_command` calls simply fail individually until it's fixed.
+
+**Recipes** (the agent only ever passes `args`; the service account is already
+activated):
+
+```jsonc
+// 1. List instances in the configured project
+{ "args": ["compute", "instances", "list"] }
+
+// 2. Stop an instance (zone defaults from config if omitted)
+{ "args": ["compute", "instances", "stop", "my-vm"] }
+
+// 3. Start it back up
+{ "args": ["compute", "instances", "start", "my-vm"] }
+
+// 4. Reset (hard reboot)
+{ "args": ["compute", "instances", "reset", "my-vm"] }
+
+// 5. Create a new instance
+{ "args": ["compute", "instances", "create", "my-new-vm",
+           "--machine-type=e2-micro", "--image-family=debian-12",
+           "--image-project=debian-cloud"] }
+
+// 6. Delete an instance
+{ "args": ["compute", "instances", "delete", "my-vm", "--quiet"] }
+
+// 7. Resize (change machine type; instance must be stopped first)
+{ "args": ["compute", "instances", "set-machine-type", "my-vm",
+           "--machine-type=e2-small"] }
+
+// 8. Disks, firewall rules, and snapshots are also in scope
+{ "args": ["compute", "disks", "list"] }
+{ "args": ["compute", "firewall-rules", "list"] }
+{ "args": ["compute", "snapshots", "list"] }
+```
+
+**Refused** (never reach a subprocess — validated before execution):
+
+```jsonc
+{ "args": ["iam", "service-accounts", "list"] }        // credential/IAM admin
+{ "args": ["billing", "accounts", "list"] }             // billing admin
+{ "args": ["auth", "print-access-token"] }              // credential exfiltration
+{ "args": ["compute", "instances", "list",
+           "--account=someone-else@x.iam.gserviceaccount.com"] } // identity pivot
+{ "args": ["compute", "instances", "list",
+           "--project=some-other-project"] }                     // project pinning bypass
+```
+
+**The service-account key is never echoed to agent-visible output**: it is
+loaded from the vault only inside `activate_service_account`, materialized to a
+`0600` temp file for the duration of that single call, then deleted; the key
+never appears in `gcloud_command` output, error messages, or the audit log
+(which records only the argv, never credentials).
+
+**Manual testing** (operator use, outside an MCP client):
+
+```bash
+mcp_deploy cli-gcloud -- compute instances list
+```
 
 ### The Secret Vault (Encrypted at Rest by Default, Selectable Backend)
 The local secret vault holds the API keys and tokens that the MCP server injects

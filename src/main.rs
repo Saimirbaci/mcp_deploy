@@ -2,6 +2,8 @@ mod audit;
 mod command_guard;
 mod config;
 mod diff;
+mod gcloud;
+mod gcloud_guard;
 mod http;
 mod mcp;
 mod scrubber;
@@ -48,6 +50,14 @@ enum Commands {
     Audit {
         #[command(subcommand)]
         action: AuditAction,
+    },
+    /// (Optional) Run a gcloud command locally via the pre-authenticated
+    /// service account, for manual smoke-testing outside an MCP client.
+    /// Example: mcp_deploy cli-gcloud -- compute instances list
+    CliGcloud {
+        /// The gcloud subcommand and flags (e.g. compute instances list)
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
     },
 }
 
@@ -286,6 +296,23 @@ fn main() -> Result<()> {
         }
         Commands::Audit { action } => {
             run_audit_action(&config_path, action)?;
+        }
+        Commands::CliGcloud { args } => {
+            let cfg = Config::load(&config_path)
+                .context(format!("Failed to load config from {}", config_path))?;
+            let gcp = cfg
+                .gcp()
+                .ok_or_else(|| anyhow::anyhow!("GCP is not configured in this config file"))?;
+            gcloud_guard::validate_gcloud_args(&args)?;
+            gcloud::activate_service_account(gcp, &cfg)?;
+            let output = gcloud::run_gcloud(&args, gcp)?;
+            print!("{}", scrubber::scrub_output(&output.stdout, &[]));
+            if !output.stderr.is_empty() {
+                eprint!("{}", scrubber::scrub_output(&output.stderr, &[]));
+            }
+            if output.exit_code != 0 {
+                std::process::exit(output.exit_code);
+            }
         }
     }
 

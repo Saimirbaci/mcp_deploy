@@ -410,6 +410,7 @@ mod tests {
             servers: HashMap::new(),
             services,
             secret_backend: crate::config::SecretBackend::default(),
+            gcp: None,
         };
         let err = call_service("ro", "DELETE", "/zones", None, None, None, &config).unwrap_err();
         assert!(err.to_string().contains("not permitted"));
@@ -503,9 +504,18 @@ mod tests {
             servers: HashMap::new(),
             services,
             secret_backend: crate::config::SecretBackend::default(),
+            gcp: None,
         };
-        let err =
-            call_service("cloudflare", "GET", "/accounts/abc", None, None, None, &config).unwrap_err();
+        let err = call_service(
+            "cloudflare",
+            "GET",
+            "/accounts/abc",
+            None,
+            None,
+            None,
+            &config,
+        )
+        .unwrap_err();
         assert!(
             err.to_string()
                 .contains("not within an allowed path prefix")
@@ -523,8 +533,10 @@ mod tests {
             servers: HashMap::new(),
             services,
             secret_backend: crate::config::SecretBackend::default(),
+            gcp: None,
         };
-        let err = call_service("confined", "GET", "/user/tokens", None, None, None, &config).unwrap_err();
+        let err =
+            call_service("confined", "GET", "/user/tokens", None, None, None, &config).unwrap_err();
         assert!(
             err.to_string()
                 .contains("not within an allowed path prefix")
@@ -633,6 +645,7 @@ mod tests {
             servers: HashMap::new(),
             services: HashMap::new(),
             secret_backend: crate::config::SecretBackend::default(),
+            gcp: None,
         };
         let err = call_service("nope", "GET", "/", None, None, None, &config).unwrap_err();
         assert!(err.to_string().contains("not in the allowed services list"));
@@ -686,10 +699,17 @@ mod tests {
                     .collect(),
             ),
             allowed_path_prefixes: Some(
-                ["/emails", "/domains", "/api-keys", "/audiences", "/broadcasts", "/webhooks"]
-                    .into_iter()
-                    .map(String::from)
-                    .collect(),
+                [
+                    "/emails",
+                    "/domains",
+                    "/api-keys",
+                    "/audiences",
+                    "/broadcasts",
+                    "/webhooks",
+                ]
+                .into_iter()
+                .map(String::from)
+                .collect(),
             ),
         }
     }
@@ -786,19 +806,13 @@ mod tests {
             servers: HashMap::new(),
             services,
             secret_backend: crate::config::SecretBackend::default(),
+            gcp: None,
         };
-        let err = call_service(
-            "resend",
-            "POST",
-            "/domains",
-            None,
-            None,
-            None,
-            &config,
-        )
-        .unwrap_err();
+        let err =
+            call_service("resend", "POST", "/domains", None, None, None, &config).unwrap_err();
         assert!(
-            err.to_string().contains("not within an allowed path prefix"),
+            err.to_string()
+                .contains("not within an allowed path prefix"),
             "expected path-prefix rejection, got: {err}"
         );
     }
@@ -872,6 +886,7 @@ mod tests {
             servers: HashMap::new(),
             services,
             secret_backend: crate::config::SecretBackend::default(),
+            gcp: None,
         };
         let err = call_service(
             "openrouter",

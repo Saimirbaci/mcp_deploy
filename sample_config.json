@@ -64,5 +64,12 @@
       "allowed_methods": ["GET", "POST", "PATCH", "DELETE"],
       "allowed_path_prefixes": ["/keys", "/credits", "/models"]
     }
+  },
+  "gcp": {
+    "project_id": "my-gcp-project",
+    "default_zone": "us-central1-a",
+    "default_region": "us-central1",
+    "key_secret_name": "GcpServiceAccountKey",
+    "cloudsdk_config_dir": "/Users/user_name/.remote_connections/gcp/config"
   }
 }

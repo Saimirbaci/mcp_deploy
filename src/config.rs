@@ -75,6 +75,46 @@ pub struct ServiceInfo {
     pub allowed_path_prefixes: Option<Vec<String>>,
 }
 
+/// Single GCP project/service-account this server is authorized to drive via
+/// `gcloud_command`. One account for v1 (unlike `servers`/`services`, which are
+/// keyed maps) — the allow-list, activation, and CLOUDSDK_CONFIG isolation are
+/// all simpler for a single pinned identity. The raw service-account JSON key
+/// never lives in this struct or the config file: only `key_secret_name`,
+/// a reference into the local vault, is stored here.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct GcpConfig {
+    /// GCP project ID that `gcloud` commands are pinned to (`--project`).
+    pub project_id: String,
+    /// Default `--zone` injected when a caller-supplied command needs one but
+    /// omits it.
+    #[serde(default)]
+    pub default_zone: Option<String>,
+    /// Default `--region` injected when a caller-supplied command needs one
+    /// but omits it.
+    #[serde(default)]
+    pub default_region: Option<String>,
+    /// Name of the secret (in the local vault) holding the service-account
+    /// JSON key contents. The key is materialized to a 0600 temp file only for
+    /// the duration of `gcloud auth activate-service-account`, then deleted.
+    pub key_secret_name: String,
+    /// Directory used as `CLOUDSDK_CONFIG` so gcloud's own credential store is
+    /// isolated from any other gcloud installation on the host. Defaults to
+    /// `$HOME/.remote_connections/gcp/config` when absent.
+    #[serde(default)]
+    pub cloudsdk_config_dir: Option<String>,
+}
+
+impl GcpConfig {
+    /// Resolve the `CLOUDSDK_CONFIG` directory, falling back to the default
+    /// under `$HOME/.remote_connections/gcp/config` when not configured.
+    pub fn resolved_cloudsdk_config_dir(&self) -> String {
+        self.cloudsdk_config_dir.clone().unwrap_or_else(|| {
+            let home = std::env::var("HOME").unwrap_or_default();
+            format!("{}/.remote_connections/gcp/config", home)
+        })
+    }
+}
+
 /// Which persistence backend the secret vault uses.
 ///
 /// Selected by the top-level `secret_backend` config field. Defaults to
@@ -109,6 +149,10 @@ pub struct Config {
     /// and secrets stay encrypted at rest by default.
     #[serde(default)]
     pub secret_backend: SecretBackend,
+    /// Optional single GCP project/service-account allow-listed for
+    /// `gcloud_command`. Absent in configs that don't use GCP (back-compat).
+    #[serde(default)]
+    pub gcp: Option<GcpConfig>,
 }
 
 /// Service name used to namespace this application's entries in the OS keychain.
@@ -337,10 +381,7 @@ impl SecretStore {
                 use std::os::unix::fs::PermissionsExt;
                 for dir in &created {
                     if let Err(e) = fs::set_permissions(dir, fs::Permissions::from_mode(0o700)) {
-                        tracing::warn!(
-                            "Failed to restrict secrets directory permissions: {}",
-                            e
-                        );
+                        tracing::warn!("Failed to restrict secrets directory permissions: {}", e);
                     }
                 }
             }
@@ -485,6 +526,11 @@ impl Config {
     /// Look up an allow-listed service by name.
     pub fn get_service(&self, name: &str) -> Option<&ServiceInfo> {
         self.services.get(name)
+    }
+
+    /// The configured GCP project/service-account, if any.
+    pub fn gcp(&self) -> Option<&GcpConfig> {
+        self.gcp.as_ref()
     }
 
     /// List the allow-listed services as `(name, base_url)` pairs. The secret
@@ -647,8 +693,8 @@ mod tests {
         // schema, exercising the same code path real deployments use.
         let manifest_dir = env!("CARGO_MANIFEST_DIR");
         let sample_path = format!("{manifest_dir}/sample_config.json");
-        let raw = fs::read_to_string(&sample_path)
-            .expect("sample_config.json must ship with the crate");
+        let raw =
+            fs::read_to_string(&sample_path).expect("sample_config.json must ship with the crate");
 
         let config: Config =
             serde_json::from_str(&raw).expect("sample_config.json must parse cleanly");
@@ -735,6 +781,77 @@ mod tests {
         assert!(allowed.iter().any(|(name, _)| name == "resend"));
         assert!(allowed.iter().any(|(name, _)| name == "resend_admin"));
         assert!(!format!("{:?}", allowed).contains("OpenRouterProvKey"));
+    }
+
+    #[test]
+    fn test_config_loads_without_gcp_block() {
+        // Back-compat: a config with no `gcp` block must still load, with
+        // `gcp()` resolving to None.
+        let json = r#"{ "servers": {} }"#;
+        let config: Config = serde_json::from_str(json).unwrap();
+        assert!(config.gcp().is_none());
+    }
+
+    #[test]
+    fn test_gcp_block_parses_with_all_fields() {
+        let json = r#"{
+            "servers": {},
+            "gcp": {
+                "project_id": "my-gcp-project",
+                "default_zone": "us-central1-a",
+                "default_region": "us-central1",
+                "key_secret_name": "GcpServiceAccountKey",
+                "cloudsdk_config_dir": "/home/deploy/.remote_connections/gcp/config"
+            }
+        }"#;
+        let config: Config = serde_json::from_str(json).unwrap();
+        let gcp = config.gcp().expect("gcp block must parse");
+        assert_eq!(gcp.project_id, "my-gcp-project");
+        assert_eq!(gcp.default_zone.as_deref(), Some("us-central1-a"));
+        assert_eq!(gcp.default_region.as_deref(), Some("us-central1"));
+        assert_eq!(gcp.key_secret_name, "GcpServiceAccountKey");
+        assert_eq!(
+            gcp.resolved_cloudsdk_config_dir(),
+            "/home/deploy/.remote_connections/gcp/config"
+        );
+    }
+
+    #[test]
+    fn test_gcp_block_parses_with_only_required_fields() {
+        let json = r#"{
+            "servers": {},
+            "gcp": {
+                "project_id": "my-gcp-project",
+                "key_secret_name": "GcpServiceAccountKey"
+            }
+        }"#;
+        let config: Config = serde_json::from_str(json).unwrap();
+        let gcp = config.gcp().expect("gcp block must parse");
+        assert_eq!(gcp.project_id, "my-gcp-project");
+        assert!(gcp.default_zone.is_none());
+        assert!(gcp.default_region.is_none());
+        assert!(gcp.cloudsdk_config_dir.is_none());
+        // Falls back to the default path under $HOME.
+        assert!(
+            gcp.resolved_cloudsdk_config_dir()
+                .ends_with("/.remote_connections/gcp/config")
+        );
+    }
+
+    #[test]
+    fn test_sample_config_gcp_block_loads() {
+        let manifest_dir = env!("CARGO_MANIFEST_DIR");
+        let sample_path = format!("{manifest_dir}/sample_config.json");
+        let raw =
+            fs::read_to_string(&sample_path).expect("sample_config.json must ship with the crate");
+        let config: Config =
+            serde_json::from_str(&raw).expect("sample_config.json must parse cleanly");
+
+        let gcp = config
+            .gcp()
+            .expect("sample_config.json must define a gcp block");
+        assert_eq!(gcp.project_id, "my-gcp-project");
+        assert_eq!(gcp.key_secret_name, "GcpServiceAccountKey");
     }
 
     #[test]
@@ -837,11 +954,9 @@ mod tests {
         for dir in [&base, &base.join("level1"), &nested] {
             let mode = fs::metadata(dir).unwrap().permissions().mode() & 0o777;
             assert_eq!(
-                mode,
-                0o700,
+                mode, 0o700,
                 "created dir {:?} must be 0700, got {:o}",
-                dir,
-                mode
+                dir, mode
             );
         }
 
@@ -872,6 +987,7 @@ mod tests {
             servers,
             services: HashMap::new(),
             secret_backend: SecretBackend::JsonFile,
+            gcp: None,
         };
 
         let values = known_secret_values(&config, "web");
